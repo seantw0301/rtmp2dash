@@ -1,14 +1,18 @@
 use crate::config::CacheConfig;
 use crate::dash::mpd::{self, MpdTrackInfo};
+use crate::dash::writer::{clear_channel_dir, PackagerWriter};
 use crate::demux::{AccessUnit, AUDIO_TRACK_ID, TIMESCALE, VIDEO_TRACK_ID};
-use anyhow::{Context, Result};
-use std::fs;
-use std::path::{Path, PathBuf};
+use anyhow::Result;
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use transmux::{CodecConfig, Sample, Segmenter, TrackSpec};
 
+const MAX_PENDING_SAMPLE_BYTES: usize = 64 * 1024 * 1024;
+
 pub struct DashPackager {
     out_dir: PathBuf,
+    writer: PackagerWriter,
     segment_duration_secs: f64,
     window_segments: usize,
     video_config: Option<CodecConfig>,
@@ -17,25 +21,24 @@ pub struct DashPackager {
     next_segment_number: u64,
     /// Inclusive start of the sliding window (segment numbers on disk).
     window_start: u64,
+    /// Preserve startup samples until both AVC and AAC configurations arrive.
+    pending_samples: VecDeque<(u32, Sample)>,
+    pending_sample_bytes: usize,
+    /// CMAF video segments must begin on a random-access sample.
+    started_on_video_sync: bool,
+    /// Coalesce MPD rewrites to at most once per `drain_ready` batch.
+    mpd_dirty: bool,
 }
 
 impl DashPackager {
     /// Create a packager for `out_dir`, clearing leftover files from a previous run.
     pub fn new(out_dir: PathBuf, cache: &CacheConfig) -> Result<Self> {
-        fs::create_dir_all(&out_dir)
-            .with_context(|| format!("create channel dir {}", out_dir.display()))?;
-        // Clear previous run artifacts (best-effort).
-        if let Ok(entries) = fs::read_dir(&out_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let _ = fs::remove_file(&path);
-                }
-            }
-        }
+        clear_channel_dir(&out_dir)?;
+        let writer = PackagerWriter::spawn(out_dir.clone());
 
         Ok(Self {
             out_dir,
+            writer,
             segment_duration_secs: cache.segment_duration_secs,
             window_segments: cache.window_segments,
             video_config: None,
@@ -43,6 +46,10 @@ impl DashPackager {
             segmenter: None,
             next_segment_number: 1,
             window_start: 1,
+            pending_samples: VecDeque::new(),
+            pending_sample_bytes: 0,
+            started_on_video_sync: false,
+            mpd_dirty: false,
         })
     }
 
@@ -76,6 +83,8 @@ impl DashPackager {
             }
             self.drain_ready();
         }
+        self.flush_mpd_if_dirty();
+        self.writer.shutdown();
     }
 
     /// Start the CMAF segmenter once both video and audio codec configs are known.
@@ -107,23 +116,67 @@ impl DashPackager {
                 return;
             }
         };
-        if let Err(err) = self.write_bytes("init.mp4", &init) {
-            warn!("write init.mp4 failed: {err:#}");
-            return;
-        }
+        self.writer.enqueue("init.mp4", init);
         self.segmenter = Some(segmenter);
-        self.write_mpd();
+        self.replay_pending_samples();
         info!(
             dir = %self.out_dir.display(),
             segment_duration_secs = self.segment_duration_secs,
-            "DASH packager started (init.mp4 written)"
+            "DASH packager started (init.mp4 queued)"
         );
     }
 
     /// Push one sample into the segmenter and drain any completed media segments.
     fn push_sample(&mut self, track_id: u32, sample: Sample) {
+        if self.segmenter.is_none() {
+            self.queue_pending_sample(track_id, sample);
+            return;
+        }
+        self.push_ready_sample(track_id, sample);
+    }
+
+    fn queue_pending_sample(&mut self, track_id: u32, sample: Sample) {
+        self.pending_sample_bytes = self.pending_sample_bytes.saturating_add(sample.data.len());
+        self.pending_samples.push_back((track_id, sample));
+        while self.pending_sample_bytes > MAX_PENDING_SAMPLE_BYTES {
+            let Some((_, dropped)) = self.pending_samples.pop_front() else {
+                break;
+            };
+            self.pending_sample_bytes =
+                self.pending_sample_bytes.saturating_sub(dropped.data.len());
+            warn!("startup sample buffer exceeded 64 MiB; dropped oldest sample");
+        }
+    }
+
+    fn replay_pending_samples(&mut self) {
+        let first_sync = self
+            .pending_samples
+            .iter()
+            .position(|(track_id, sample)| *track_id == VIDEO_TRACK_ID && sample.is_sync);
+        let Some(first_sync) = first_sync else {
+            self.pending_samples.clear();
+            self.pending_sample_bytes = 0;
+            debug!("waiting for first video keyframe after codec configuration");
+            return;
+        };
+        for _ in 0..first_sync {
+            self.pending_samples.pop_front();
+        }
+        let pending = std::mem::take(&mut self.pending_samples);
+        self.pending_sample_bytes = 0;
+        for (track_id, sample) in pending {
+            self.push_ready_sample(track_id, sample);
+        }
+    }
+
+    fn push_ready_sample(&mut self, track_id: u32, sample: Sample) {
+        if !self.started_on_video_sync {
+            if track_id != VIDEO_TRACK_ID || !sample.is_sync {
+                return;
+            }
+            self.started_on_video_sync = true;
+        }
         let Some(seg) = self.segmenter.as_mut() else {
-            debug!("dropping sample before segmenter ready (track={track_id})");
             return;
         };
         if let Err(err) = seg.push(track_id, sample) {
@@ -141,17 +194,15 @@ impl DashPackager {
             .map(|s| s.take_ready())
             .unwrap_or_default();
         for media in ready {
-            let name = format!("seg_{}.m4s", self.next_segment_number);
-            if let Err(err) = self.write_bytes(&name, &media) {
-                warn!(segment = self.next_segment_number, "write segment failed: {err:#}");
-                // Still advance number to avoid colliding filenames on next success.
-            } else {
-                info!(segment = self.next_segment_number, "wrote media segment");
-            }
+            let number = self.next_segment_number;
+            let name = format!("seg_{number}.m4s");
+            self.writer.enqueue(&name, media);
+            debug!(segment = number, "queued media segment");
             self.next_segment_number = self.next_segment_number.saturating_add(1);
             self.prune_window();
-            self.write_mpd();
+            self.mpd_dirty = true;
         }
+        self.flush_mpd_if_dirty();
     }
 
     /// Drop segment files that fall outside the configured sliding window.
@@ -160,38 +211,17 @@ impl DashPackager {
             > self.window_segments as u64
         {
             let old = self.window_start;
-            let path = self.out_dir.join(format!("seg_{old}.m4s"));
-            let _ = fs::remove_file(&path);
             self.window_start = self.window_start.saturating_add(1);
+            self.writer.delete(&format!("seg_{old}.m4s"));
         }
-        self.prune_orphaned_segments();
     }
 
-    /// Remove on-disk `seg_*.m4s` files older than the current window start.
-    fn prune_orphaned_segments(&self) {
-        let Ok(entries) = fs::read_dir(&self.out_dir) else {
+    /// Render and enqueue `index.mpd` when the timeline changed since the last write.
+    fn flush_mpd_if_dirty(&mut self) {
+        if !self.mpd_dirty {
             return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(num) = name
-                .strip_prefix("seg_")
-                .and_then(|s| s.strip_suffix(".m4s"))
-                .and_then(|s| s.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if num < self.window_start {
-                let _ = fs::remove_file(&path);
-            }
         }
-    }
-
-    /// Render and atomically write `index.mpd` for the current sliding window.
-    fn write_mpd(&self) {
+        self.mpd_dirty = false;
         let (Some(video_cfg), Some(audio_cfg)) =
             (self.video_config.as_ref(), self.audio_config.as_ref())
         else {
@@ -208,27 +238,13 @@ impl DashPackager {
             &video,
             Some(&audio),
         );
-        if let Err(err) = self.write_bytes("index.mpd", xml.as_bytes()) {
-            warn!("write index.mpd failed: {err:#}");
-        }
-    }
-
-    /// Atomically write `data` to a file named `name` under the channel output directory.
-    fn write_bytes(&self, name: &str, data: &[u8]) -> Result<()> {
-        let path = self.out_dir.join(name);
-        atomic_write(&path, data).with_context(|| format!("write {}", path.display()))
+        self.writer.enqueue("index.mpd", xml.into_bytes());
     }
 }
 
-/// Write `data` via a temp file then rename, so readers never see a partial file.
-fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, data)?;
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
-            Err(err.into())
-        }
+impl Drop for DashPackager {
+    fn drop(&mut self) {
+        self.flush_mpd_if_dirty();
+        self.writer.shutdown();
     }
 }

@@ -70,9 +70,11 @@ OBS：伺服器 `rtmp://127.0.0.1:1935/live`，串流金鑰填 `demo`（即 chan
 http://127.0.0.1:8080/live/demo/index.mpd
 ```
 
-**VLC**：選「媒體 → 開啟網路串流」。若仍無畫面，確認服務仍在推/拉流（`curl` 該 MPD 應回 200，且 cache 目錄持續出現新的 `seg_*.m4s`）。Live DASH 需播放器依 `availabilityStartTime` 對齊時鐘；本服務每次更新 MPD 都會重算該時間，避免開播過久後 VLC 請求不存在的未來 segment。
+**VLC**：選「媒體 → 開啟網路串流」。若仍無畫面，確認服務仍在推/拉流（`curl` 該 MPD 應回 200，且 cache 目錄持續出現新的 `seg_*.m4s`）。Live MPD 使用固定 `availabilityStartTime` + `SegmentTimeline`（對齊各段 `tfdt`），播放器需定期刷新 MPD（`minimumUpdatePeriod`）才能持續追 live edge。
 
 亦可改用瀏覽器 + dash.js / Shaka Player 測試。
+
+本機 Homebrew 的 `ffmpeg`/`ffprobe` 若未編入 `dash` demuxer，無法直接 `-i index.mpd`；可改測 `init.mp4` 與 `seg_N.m4s`（先 concat 再 ffprobe），或輪詢 MPD 的 `SegmentTimeline` / `startNumber` 是否持續前進。
 
 ## 自動化煙霧測試
 

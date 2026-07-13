@@ -12,6 +12,7 @@ cache:
   # Target DASH segment length in seconds (default: 2). Cuts on video keyframes
   # once this duration has been buffered.
   segment_duration_secs: 2
+  # Keep a short live window; older files are removed as soon as they leave it.
   window_segments: 10
   # Delete expired seg_*.m4s / index.mpd older than this (seconds).
   # init.mp4 is never deleted by the janitor.

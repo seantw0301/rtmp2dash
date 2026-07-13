@@ -5,6 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 
+/// Cap deletions per channel per sweep so one large directory cannot starve others.
+const MAX_DELETIONS_PER_CHANNEL_SWEEP: usize = 100;
+
 /// Periodically delete stale **segment** files under `cache/live/`.
 /// Never deletes `init.mp4` or `index.mpd` (required for live playback).
 pub async fn run(cfg: Arc<Config>) {
@@ -16,13 +19,13 @@ pub async fn run(cfg: Arc<Config>) {
         root = %live_root.display(),
         ttl_secs = ttl.as_secs(),
         interval_secs = interval.as_secs(),
+        max_deletions_per_channel_sweep = MAX_DELETIONS_PER_CHANNEL_SWEEP,
         "cache janitor started (preserves init.mp4 + index.mpd)"
     );
 
     loop {
         match tokio::task::spawn_blocking({
             let live_root = live_root.clone();
-            let ttl = ttl;
             move || sweep(&live_root, ttl)
         })
         .await
@@ -34,7 +37,7 @@ pub async fn run(cfg: Arc<Config>) {
     }
 }
 
-/// Scan all channel dirs under `live_root` and delete expired media segments.
+/// Scan channel dirs under `live_root` and delete expired media segments (batched).
 fn sweep(live_root: &Path, ttl: Duration) -> usize {
     if !live_root.is_dir() {
         return 0;
@@ -52,23 +55,29 @@ fn sweep(live_root: &Path, ttl: Duration) -> usize {
         if !channel_dir.is_dir() {
             continue;
         }
-        removed += sweep_channel(&channel_dir, now, ttl);
+        removed += sweep_channel(&channel_dir, now, ttl, MAX_DELETIONS_PER_CHANNEL_SWEEP);
     }
 
     if removed > 0 {
-        info!(removed, "cache janitor cleaned old segment files");
+        debug!(removed, "cache janitor cleaned old segment files");
     }
     removed
 }
 
 /// Delete expired `seg_*.m4s` (and stray `.tmp`) files in one channel directory.
-fn sweep_channel(channel_dir: &Path, now: SystemTime, ttl: Duration) -> usize {
+fn sweep_channel(channel_dir: &Path, now: SystemTime, ttl: Duration, mut budget: usize) -> usize {
+    if budget == 0 {
+        return 0;
+    }
     let Ok(entries) = fs::read_dir(channel_dir) else {
         return 0;
     };
     let mut removed = 0usize;
 
     for entry in entries.flatten() {
+        if budget == 0 {
+            break;
+        }
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -82,10 +91,13 @@ fn sweep_channel(channel_dir: &Path, now: SystemTime, ttl: Duration) -> usize {
             continue;
         }
 
-        // Leftover atomic-write temps.
+        // Remove only stale atomic-write temps. Packager writes and renames these
+        // concurrently, so unconditional deletion can race an active MPD/segment write.
         if name.ends_with(".tmp") {
-            if fs::remove_file(&path).is_ok() {
+            let stale_temp = file_is_expired(&path, now, Duration::from_secs(60));
+            if stale_temp && fs::remove_file(&path).is_ok() {
                 removed += 1;
+                budget -= 1;
             }
             continue;
         }
@@ -101,6 +113,7 @@ fn sweep_channel(channel_dir: &Path, now: SystemTime, ttl: Duration) -> usize {
                 Ok(()) => {
                     debug!(file = %path.display(), "deleted expired segment");
                     removed += 1;
+                    budget -= 1;
                 }
                 Err(err) => warn!(file = %path.display(), %err, "failed to delete segment"),
             }

@@ -10,6 +10,7 @@ use axum::routing::get;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio_util::io::ReaderStream;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
@@ -49,6 +50,7 @@ pub async fn run(cfg: Arc<Config>, channels: ChannelManager) -> anyhow::Result<(
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/channels", get(list_channels))
+        .route("/metrics", get(metrics))
         .route("/live/{channel}/index.mpd", get(serve_mpd))
         .route("/live/{channel}/{file}", get(serve_media))
         .layer(cors)
@@ -58,6 +60,16 @@ pub async fn run(cfg: Arc<Config>, channels: ChannelManager) -> anyhow::Result<(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// `GET /metrics` — basic Prometheus-style active channel count.
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let channels = state.channels.list_active().len();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        format!("rtmp2dash_active_channels {channels}\n"),
+    )
 }
 
 /// `GET /channels` — list channels that currently hold an active ingest lease.
@@ -84,16 +96,13 @@ async fn serve_mpd(State(state): State<AppState>, Path(channel): Path<String>) -
         .join("live")
         .join(&channel)
         .join("index.mpd");
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/dash+xml")
-            .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .body(Body::from(bytes))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-        Err(_) => (StatusCode::NOT_FOUND, "channel offline or mpd missing").into_response(),
-    }
+    serve_file_stream(
+        &path,
+        "application/dash+xml",
+        "no-cache, no-store, must-revalidate",
+        Some("channel offline or mpd missing"),
+    )
+    .await
 }
 
 /// Serve `/live/{channel}/{file}` for init segments and media segments.
@@ -105,22 +114,37 @@ async fn serve_media(
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
     }
     let path = state.cache_dir.join("live").join(&channel).join(&file);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            let content_type = if file.ends_with(".mp4") || file.ends_with(".m4s") {
-                "video/mp4"
-            } else {
-                "application/octet-stream"
-            };
+    let content_type = if file.ends_with(".mp4") || file.ends_with(".m4s") {
+        "video/mp4"
+    } else {
+        "application/octet-stream"
+    };
+    serve_file_stream(&path, content_type, "no-cache", None).await
+}
+
+/// Stream a cache file from disk without buffering the whole payload in memory.
+async fn serve_file_stream(
+    path: &std::path::Path,
+    content_type: &str,
+    cache_control: &str,
+    not_found_body: Option<&'static str>,
+) -> Response {
+    match tokio::fs::File::open(path).await {
+        Ok(file) => {
+            let stream = ReaderStream::new(file);
+            let body = Body::from_stream(stream);
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type)
-                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CACHE_CONTROL, cache_control)
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Body::from(bytes))
+                .body(body)
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => match not_found_body {
+            Some(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
     }
 }
 

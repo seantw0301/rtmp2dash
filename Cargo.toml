@@ -8,6 +8,9 @@ readme = "README.md"
 keywords = ["rtmp", "dash", "streaming", "live", "h264"]
 categories = ["multimedia", "network-programming"]
 
+# Standalone package: ignore any parent Cargo workspace (e.g. extracted under /home/.../Cargo.toml).
+[workspace]
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"
@@ -20,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

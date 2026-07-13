@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::fs;
 use std::net::SocketAddr;
@@ -47,11 +47,12 @@ pub struct CacheConfig {
 impl CacheConfig {
     /// Effective TTL used by the janitor (never below the live window duration).
     pub fn effective_ttl_secs(&self) -> u64 {
-        let window_secs =
-            (self.window_segments as f64 * self.segment_duration_secs).ceil() as u64;
+        let window_secs = (self.window_segments as f64 * self.segment_duration_secs).ceil() as u64;
         let floor = window_secs.saturating_mul(2).max(30);
         match self.ttl_secs {
-            Some(t) => t.max(window_secs.max(1)),
+            // Keep a full extra advertised window as grace for clients that are
+            // still consuming a previously fetched MPD.
+            Some(t) => t.max(floor),
             None => floor,
         }
     }

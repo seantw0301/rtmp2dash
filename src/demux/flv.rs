@@ -104,7 +104,7 @@ impl FlvDemux {
             }
             AVC_PACKET_NALU => {
                 let is_sync = frame_type == FRAME_TYPE_KEYFRAME;
-                let sample = Sample::new(payload.to_vec(), 0, is_sync, composition_time);
+                let sample = Sample::from_annexb(payload, 0, is_sync, composition_time);
                 Ok(self.enqueue_video(sample, dts_ms))
             }
             _ => Ok(vec![]),

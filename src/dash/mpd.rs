@@ -14,7 +14,10 @@ impl MpdTrackInfo {
     pub fn from_video(config: &CodecConfig) -> Self {
         match config {
             CodecConfig::Avc {
-                config, width, height, ..
+                config,
+                width,
+                height,
+                ..
             } => Self {
                 codecs: format!(
                     "avc1.{:02X}{:02X}{:02X}",
@@ -56,9 +59,9 @@ impl MpdTrackInfo {
 
 /// Build a live (dynamic) MPD for multiplexed CMAF segments.
 ///
-/// `availabilityStartTime` is recomputed on every refresh so that wall-clock based
-/// players (VLC) map the live edge onto the current sliding window (`startNumber`…
-/// `latest_number`), instead of drifting ahead after the stream has been up a while.
+/// Re-anchor `availabilityStartTime` to the current numbered window on every
+/// refresh. This fixed-duration form is understood by DASH clients that reject
+/// a multiplexed audio/video Representation with SegmentTimeline.
 pub fn render_live_mpd(
     segment_duration_secs: f64,
     window_segments: usize,
@@ -72,19 +75,10 @@ pub fn render_live_mpd(
     let min_update = segment_duration_secs.max(1.0);
     let suggested = (segment_duration_secs * 2.0).max(2.0);
     let publish_time = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-
-    // Segments present in the sliding window (inclusive).
-    let segs_available = if latest_number >= start_number {
-        latest_number - start_number + 1
-    } else {
-        0
-    };
-    // Place AST so: startNumber ≈ available at AST, and live edge ≈ latest.
-    // availability(N) = AST + (N - startNumber) * duration
-    // ⇒ AST = now - (latest - startNumber) * duration - suggestedDelay
-    let elapsed_ms = if segs_available > 0 {
+    let segments_available = latest_number.saturating_sub(start_number).saturating_add(1);
+    let elapsed_ms = if latest_number >= start_number {
         let from_start_to_latest =
-            (segs_available.saturating_sub(1) as f64) * segment_duration_secs * 1000.0;
+            segments_available.saturating_sub(1) as f64 * segment_duration_secs * 1000.0;
         (from_start_to_latest + suggested * 1000.0) as i64
     } else {
         (buffer_depth * 1000.0) as i64
@@ -142,4 +136,28 @@ pub fn render_live_mpd(
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn fixed_duration_manifest_tracks_sliding_window() {
+        let video = MpdTrackInfo {
+            codecs: "avc1.42E01E".into(),
+            width: Some(640),
+            height: Some(360),
+            sample_rate: None,
+        };
+        let audio = MpdTrackInfo {
+            codecs: "mp4a.40.2".into(),
+            width: None,
+            height: None,
+            sample_rate: Some(44100),
+        };
+        let xml = render_live_mpd(2.0, 10, 5, 14, &video, Some(&audio));
+        assert!(xml.contains("type=\"dynamic\""));
+        assert!(xml.contains("startNumber=\"5\""));
+        assert!(xml.contains("duration=\"2000\""));
+        assert!(!xml.contains("<SegmentTimeline>"));
+    }
+}
