@@ -104,7 +104,10 @@ impl FlvDemux {
             }
             AVC_PACKET_NALU => {
                 let is_sync = frame_type == FRAME_TYPE_KEYFRAME;
-                let sample = Sample::from_annexb(payload, 0, is_sync, composition_time);
+                // FLV/RTMP AVC NALU payloads are already length-prefixed (AVCC).
+                // Sample::from_annexb expects Annex-B start codes and would yield
+                // empty data on normal RTMP ingest — producing m4s with 0-byte video.
+                let sample = Sample::new(payload.to_vec(), 0, is_sync, composition_time);
                 Ok(self.enqueue_video(sample, dts_ms))
             }
             _ => Ok(vec![]),
@@ -277,3 +280,33 @@ fn build_aac_esds(asc_bytes: Vec<u8>) -> EsdsBox {
         }),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avc_nalu_keeps_length_prefixed_payload() {
+        // RTMP AVC NALU body is AVCC (4-byte length + NAL), not Annex-B.
+        let nal = [0x65u8, 0x88, 0x84];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&nal);
+        let mut tag = vec![0x17, 0x01, 0x00, 0x00, 0x00]; // keyframe + AVC NALU
+        tag.extend_from_slice(&payload);
+
+        let mut demux = FlvDemux::new();
+        let _ = demux.push_video(&tag, 0).unwrap();
+        // Second frame finalizes the first sample's duration.
+        let mut tag2 = vec![0x27, 0x01, 0x00, 0x00, 0x00];
+        tag2.extend_from_slice(&payload);
+        let aus = demux.push_video(&tag2, 33).unwrap();
+        let AccessUnit::VideoSample(sample) = &aus[0] else {
+            panic!("expected video sample");
+        };
+        assert_eq!(sample.data, payload);
+        assert!(!sample.data.is_empty());
+        assert!(sample.is_sync);
+    }
+}
+
