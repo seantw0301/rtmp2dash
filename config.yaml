@@ -1,0 +1,29 @@
+rtmp:
+  listen: "0.0.0.0"
+  port: 1935
+  app: "live"
+
+dash:
+  listen: "0.0.0.0"
+  port: 8080
+
+cache:
+  dir: "./cache"
+  # Target DASH segment length in seconds (default: 2). Cuts on video keyframes
+  # once this duration has been buffered.
+  segment_duration_secs: 2
+  window_segments: 10
+  # Delete expired seg_*.m4s / index.mpd older than this (seconds).
+  # init.mp4 is never deleted by the janitor.
+  # Default when omitted: max(30, window_segments * segment_duration_secs * 2)
+  # ttl_secs: 60
+  cleanup_interval_secs: 10
+
+# Pull remote RTMP sources in parallel with local publish ingest.
+# Each entry remuxes to http://<dash.host>:<dash.port>/live/<channel>/index.mpd
+# Example (replace with your own origin; do not commit real production URLs):
+# pull:
+#   - url: "rtmp://origin.example.com:1935/live/stream1"
+#     channel: "demo"
+#     reconnect_secs: 3
+pull: []

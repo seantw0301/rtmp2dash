@@ -1,0 +1,7 @@
+/target/
+/cache/
+/script/rtmp2dash.pid
+/script/rtmp2dash.log
+/script/.smoke/
+**/*.tmp
+.DS_Store

@@ -1,0 +1,28 @@
+[package]
+name = "rtmp2dash"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust RTMP ingest to live MPEG-DASH (H.264 + AAC remux)"
+license = "MIT"
+readme = "README.md"
+keywords = ["rtmp", "dash", "streaming", "live", "h264"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+broadcast-common = "8"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+rml_rtmp = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+transmux = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+http = "1"
