@@ -53,7 +53,7 @@ Publish and play example:
 
 ```bash
 ffmpeg -re -i input.mp4 -c:v libx264 -g 60 -keyint_min 60 -sc_threshold 0 \
-  -c:a aac -f flv rtmp://127.0.0.1:1935/live/demo
+  -c:a aac -f flv rtmp://127.0.0.1:6136/live/demo
 
 # Play
 open http://127.0.0.1:8080/live/demo/index.mpd

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc as async_mpsc;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 const WRITE_QUEUE_DEPTH: usize = 64;
@@ -16,12 +17,13 @@ enum WriteJob {
 pub struct PackagerWriter {
     out_dir: PathBuf,
     tx: Option<async_mpsc::Sender<WriteJob>>,
+    join: Option<JoinHandle<()>>,
 }
 
 impl PackagerWriter {
     pub fn spawn(out_dir: PathBuf) -> Self {
         let (tx, mut rx) = async_mpsc::channel(WRITE_QUEUE_DEPTH);
-        tokio::spawn(async move {
+        let join = tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
                 match job {
                     WriteJob::Bytes { path, data } => {
@@ -51,6 +53,7 @@ impl PackagerWriter {
         Self {
             out_dir,
             tx: Some(tx),
+            join: Some(join),
         }
     }
 
@@ -89,9 +92,29 @@ impl PackagerWriter {
         }
     }
 
-    /// Close the sender. The background receiver drains queued jobs before ending.
+    /// Close the sender without waiting for the background task (Drop / best-effort).
     pub fn shutdown(&mut self) {
         self.tx.take();
+    }
+
+    /// Close the sender and wait until every queued write/delete has finished.
+    /// Call this before replacing a packager so an old MPD cannot land after a wipe.
+    pub async fn shutdown_and_drain(&mut self) {
+        self.tx.take();
+        if let Some(join) = self.join.take() {
+            if let Err(err) = join.await {
+                warn!("packager writer task join failed: {err:#}");
+            }
+        }
+    }
+}
+
+impl Drop for PackagerWriter {
+    fn drop(&mut self) {
+        self.tx.take();
+        // JoinHandle is dropped without awaiting — Tokio cancels on Abort,
+        // but the channel close already lets the task exit after draining.
+        // Prefer `shutdown_and_drain` at explicit finish points.
     }
 }
 
@@ -121,4 +144,21 @@ pub(crate) fn clear_channel_dir(out_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_and_drain_flushes_queued_writes() {
+        let dir = tempdir().unwrap();
+        let mut writer = PackagerWriter::spawn(dir.path().to_path_buf());
+        writer.enqueue("a.bin", b"hello".to_vec());
+        writer.enqueue("b.bin", b"world".to_vec());
+        writer.shutdown_and_drain().await;
+        assert_eq!(fs::read(dir.path().join("a.bin")).unwrap(), b"hello");
+        assert_eq!(fs::read(dir.path().join("b.bin")).unwrap(), b"world");
+    }
 }

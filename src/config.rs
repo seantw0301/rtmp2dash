@@ -137,9 +137,9 @@ fn default_segment_duration() -> f64 {
     2.0
 }
 
-/// Default number of segments kept in the live sliding window.
+/// Default number of segments kept in the live sliding window (~3 min at 2s/seg).
 fn default_window_segments() -> usize {
-    10
+    90
 }
 
 /// Default interval between cache janitor sweeps, in seconds.

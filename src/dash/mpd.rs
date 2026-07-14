@@ -1,4 +1,4 @@
-use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use transmux::CodecConfig;
 
 #[derive(Debug, Clone)]
@@ -7,6 +7,20 @@ pub struct MpdTrackInfo {
     pub width: Option<u16>,
     pub height: Option<u16>,
     pub sample_rate: Option<u32>,
+}
+
+/// One on-disk media segment as advertised in `SegmentTimeline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineEntry {
+    pub number: u64,
+    /// Absolute media start time (tfdt baseMediaDecodeTime) in MPD timescale ticks.
+    ///
+    /// Must NOT reset when the sliding window advances — players track their
+    /// playback position in Period media time, so the timeline has to keep
+    /// moving forward across MPD updates.
+    pub start_ticks: u64,
+    /// Media duration in MPD timescale ticks (1000 = milliseconds).
+    pub duration_ticks: u64,
 }
 
 impl MpdTrackInfo {
@@ -57,34 +71,38 @@ impl MpdTrackInfo {
     }
 }
 
-/// Build a live (dynamic) MPD for multiplexed CMAF segments.
+/// Build a live MPD whose timeline matches **actual** segment media durations.
 ///
-/// Re-anchor `availabilityStartTime` to the current numbered window on every
-/// refresh. This fixed-duration form is understood by DASH clients that reject
-/// a multiplexed audio/video Representation with SegmentTimeline.
+/// Uses `SegmentTimeline` (no fixed `@duration`) so players request only numbers
+/// present in `entries`. `availabilityStartTime` is anchored so the window ends
+/// at ≈ `now`.
 pub fn render_live_mpd(
-    segment_duration_secs: f64,
-    window_segments: usize,
-    start_number: u64,
-    latest_number: u64,
+    entries: &[TimelineEntry],
+    availability_start_time: DateTime<Utc>,
     video: &MpdTrackInfo,
     audio: Option<&MpdTrackInfo>,
 ) -> String {
-    let duration_ticks = (segment_duration_secs * 1000.0).round() as u64;
-    let buffer_depth = segment_duration_secs * window_segments as f64;
-    let min_update = segment_duration_secs.max(1.0);
-    let suggested = (segment_duration_secs * 2.0).max(2.0);
+    assert!(!entries.is_empty(), "entries must not be empty");
+    let start_number = entries[0].number;
+    let max_ticks = entries
+        .iter()
+        .map(|e| e.duration_ticks.max(1))
+        .max()
+        .unwrap_or(2000);
+    let buffer_depth_secs = entries
+        .iter()
+        .map(|e| e.duration_ticks as f64 / 1000.0)
+        .sum::<f64>()
+        .max(1.0);
+    let avg_secs = buffer_depth_secs / entries.len() as f64;
+    let min_update = avg_secs.clamp(1.0, 4.0);
+    let suggested = (avg_secs * 3.0)
+        .max(4.0)
+        .min(buffer_depth_secs * 0.5)
+        .max(1.0);
     let publish_time = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let segments_available = latest_number.saturating_sub(start_number).saturating_add(1);
-    let elapsed_ms = if latest_number >= start_number {
-        let from_start_to_latest =
-            segments_available.saturating_sub(1) as f64 * segment_duration_secs * 1000.0;
-        (from_start_to_latest + suggested * 1000.0) as i64
-    } else {
-        (buffer_depth * 1000.0) as i64
-    };
-    let availability_start_time = (Utc::now() - ChronoDuration::milliseconds(elapsed_ms.max(0)))
-        .to_rfc3339_opts(SecondsFormat::Secs, true);
+    let availability_start_time =
+        availability_start_time.to_rfc3339_opts(SecondsFormat::Secs, true);
 
     let codecs = match audio {
         Some(a) => format!("{},{}", video.codecs, a.codecs),
@@ -105,6 +123,8 @@ pub fn render_live_mpd(
         .map(|r| format!(r#" audioSamplingRate="{r}""#))
         .unwrap_or_default();
 
+    let timeline = render_segment_timeline(entries);
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
@@ -123,41 +143,215 @@ pub fn render_live_mpd(
     <AdaptationSet id="0" contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1" bitstreamSwitching="true"{width_attr}{height_attr}{audio_sampling}>
       <Representation id="0" bandwidth="2500000" codecs="{codecs}"{width_attr}{height_attr}>
         <SegmentTemplate timescale="1000"
-                         duration="{duration_ticks}"
                          initialization="init.mp4"
                          media="seg_$Number$.m4s"
-                         startNumber="{start_number}"/>
+                         startNumber="{start_number}">
+{timeline}        </SegmentTemplate>
       </Representation>
     </AdaptationSet>
   </Period>
 </MPD>
 "#,
-        min_buffer = segment_duration_secs,
+        buffer_depth = buffer_depth_secs,
+        min_buffer = max_ticks as f64 / 1000.0,
     )
+}
+
+/// Compact `SegmentTimeline` with run-length `r` when consecutive equal durations.
+///
+/// Uses each entry's absolute `start_ticks` for `t`, so the timeline keeps
+/// advancing as the sliding window moves (never resets to 0 between MPD updates).
+fn render_segment_timeline(entries: &[TimelineEntry]) -> String {
+    let mut out = String::from("          <SegmentTimeline>\n");
+    let mut i = 0usize;
+    let mut expected_t: Option<u64> = None;
+    while i < entries.len() {
+        let d = entries[i].duration_ticks.max(1);
+        let t = entries[i].start_ticks;
+        let mut run = 0u64;
+        while i + 1 + (run as usize) < entries.len() {
+            let next = &entries[i + 1 + (run as usize)];
+            let contiguous = next.duration_ticks.max(1) == d
+                && next.number == entries[i].number + 1 + run
+                && next.start_ticks == t.saturating_add(d.saturating_mul(run + 1));
+            if !contiguous {
+                break;
+            }
+            run += 1;
+        }
+        // Emit `t` on the first S and whenever there is a gap/drift in media time.
+        let need_t = expected_t != Some(t);
+        match (need_t, run > 0) {
+            (true, true) => out.push_str(&format!(
+                "            <S t=\"{t}\" d=\"{d}\" r=\"{run}\"/>\n"
+            )),
+            (true, false) => out.push_str(&format!("            <S t=\"{t}\" d=\"{d}\"/>\n")),
+            (false, true) => out.push_str(&format!("            <S d=\"{d}\" r=\"{run}\"/>\n")),
+            (false, false) => out.push_str(&format!("            <S d=\"{d}\"/>\n")),
+        }
+        let count = run + 1;
+        expected_t = Some(t.saturating_add(d.saturating_mul(count)));
+        i += count as usize;
+    }
+    out.push_str("          </SegmentTimeline>\n");
+    out
+}
+
+/// Anchor AST so the **live edge** (end of the newest segment in media time)
+/// maps to `now`. Called once per generation; the result must then stay fixed
+/// for every subsequent MPD update, otherwise players lose their position.
+pub fn availability_start_for_live_edge(
+    now: DateTime<Utc>,
+    entries: &[TimelineEntry],
+) -> DateTime<Utc> {
+    let edge_ms = entries
+        .last()
+        .map(|e| e.start_ticks.saturating_add(e.duration_ticks.max(1)) as i64)
+        .unwrap_or(0);
+    now - ChronoDuration::milliseconds(edge_ms.max(0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn tracks() -> (MpdTrackInfo, MpdTrackInfo) {
+        (
+            MpdTrackInfo {
+                codecs: "avc1.42E01E".into(),
+                width: Some(640),
+                height: Some(360),
+                sample_rate: None,
+            },
+            MpdTrackInfo {
+                codecs: "mp4a.40.2".into(),
+                width: None,
+                height: None,
+                sample_rate: Some(44100),
+            },
+        )
+    }
+
     #[test]
-    fn fixed_duration_manifest_tracks_sliding_window() {
-        let video = MpdTrackInfo {
-            codecs: "avc1.42E01E".into(),
-            width: Some(640),
-            height: Some(360),
-            sample_rate: None,
-        };
-        let audio = MpdTrackInfo {
-            codecs: "mp4a.40.2".into(),
-            width: None,
-            height: None,
-            sample_rate: Some(44100),
-        };
-        let xml = render_live_mpd(2.0, 10, 5, 14, &video, Some(&audio));
-        assert!(xml.contains("type=\"dynamic\""));
-        assert!(xml.contains("startNumber=\"5\""));
-        assert!(xml.contains("duration=\"2000\""));
-        assert!(!xml.contains("<SegmentTimeline>"));
+    fn timeline_uses_actual_durations_not_fixed_two_seconds() {
+        let (video, audio) = tracks();
+        let entries = [
+            TimelineEntry {
+                number: 10,
+                start_ticks: 18_000,
+                duration_ticks: 2100,
+            },
+            TimelineEntry {
+                number: 11,
+                start_ticks: 20_100,
+                duration_ticks: 1900,
+            },
+            TimelineEntry {
+                number: 12,
+                start_ticks: 22_000,
+                duration_ticks: 2400,
+            },
+        ];
+        let ast = DateTime::parse_from_rfc3339("2026-07-13T22:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let xml = render_live_mpd(&entries, ast, &video, Some(&audio));
+        assert!(xml.contains("startNumber=\"10\""));
+        assert!(xml.contains("<SegmentTimeline>"));
+        assert!(xml.contains("t=\"18000\""));
+        assert!(xml.contains("d=\"2100\""));
+        assert!(xml.contains("d=\"1900\""));
+        assert!(xml.contains("d=\"2400\""));
+        assert!(!xml.contains("duration=\"2000\""));
+        assert!(xml.contains("timeShiftBufferDepth=\"PT6.400S\""));
+    }
+
+    #[test]
+    fn timeline_runs_collapse_equal_durations() {
+        let entries = [
+            TimelineEntry {
+                number: 1,
+                start_ticks: 0,
+                duration_ticks: 2000,
+            },
+            TimelineEntry {
+                number: 2,
+                start_ticks: 2000,
+                duration_ticks: 2000,
+            },
+            TimelineEntry {
+                number: 3,
+                start_ticks: 4000,
+                duration_ticks: 2000,
+            },
+        ];
+        let xml = render_segment_timeline(&entries);
+        assert!(xml.contains("r=\"2\""));
+        assert!(xml.contains("t=\"0\""));
+    }
+
+    #[test]
+    fn timeline_preserves_absolute_start_after_window_slide() {
+        // Window slid: first advertised segment starts at media time 60s.
+        let entries = [
+            TimelineEntry {
+                number: 31,
+                start_ticks: 60_000,
+                duration_ticks: 2000,
+            },
+            TimelineEntry {
+                number: 32,
+                start_ticks: 62_000,
+                duration_ticks: 2000,
+            },
+        ];
+        let xml = render_segment_timeline(&entries);
+        assert!(xml.contains("t=\"60000\""));
+        assert!(!xml.contains("t=\"0\""));
+        assert!(xml.contains("r=\"1\""));
+    }
+
+    #[test]
+    fn timeline_emits_new_t_on_media_gap() {
+        let entries = [
+            TimelineEntry {
+                number: 1,
+                start_ticks: 0,
+                duration_ticks: 2000,
+            },
+            // Gap: segment 2 starts at 5000 instead of 2000.
+            TimelineEntry {
+                number: 2,
+                start_ticks: 5000,
+                duration_ticks: 2000,
+            },
+        ];
+        let xml = render_segment_timeline(&entries);
+        assert!(xml.contains("t=\"0\""));
+        assert!(xml.contains("t=\"5000\""));
+    }
+
+    #[test]
+    fn availability_anchors_live_edge_to_now() {
+        let now = DateTime::parse_from_rfc3339("2026-07-13T22:10:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let entries = [
+            TimelineEntry {
+                number: 1,
+                start_ticks: 0,
+                duration_ticks: 2100,
+            },
+            TimelineEntry {
+                number: 2,
+                start_ticks: 2100,
+                duration_ticks: 1900,
+            },
+        ];
+        let ast = availability_start_for_live_edge(now, &entries);
+        assert_eq!(
+            ast.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2026-07-13T22:09:56Z"
+        );
     }
 }

@@ -183,7 +183,7 @@ async fn handle_connection(
         }
     }
     if let Some(mut p) = packager.take() {
-        p.finish();
+        p.finish().await;
     }
     if let Some(ch) = guard.channel.clone() {
         info!(channel = %ch, "publisher disconnected");
@@ -332,7 +332,7 @@ async fn handle_event(
                 }
             }
             if let Some(mut p) = packager.take() {
-                p.finish();
+                p.finish().await;
             }
             guard.clear();
         }

@@ -64,7 +64,7 @@ rtmp2dash v${VERSION} — RTMP → live MPEG-DASH
 Package: ${kind}
 ${platform_line}
 
-推流：rtmp://<host>:1935/live/<channel>
+推流：rtmp://<host>:6136/live/<channel>
 播放：http://<host>:8080/live/<channel>/index.mpd
 
 請依需求編輯 config.yaml。Codec：僅 H.264 + AAC。

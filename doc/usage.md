@@ -55,10 +55,10 @@ pull:
 ffmpeg -re -i input.mp4 \
   -c:v libx264 -pix_fmt yuv420p -g 60 -keyint_min 60 -sc_threshold 0 \
   -c:a aac -f flv \
-  rtmp://127.0.0.1:1935/live/demo
+  rtmp://127.0.0.1:6136/live/demo
 ```
 
-OBS：伺服器 `rtmp://127.0.0.1:1935/live`，串流金鑰填 `demo`（即 channel id）。
+OBS：伺服器 `rtmp://127.0.0.1:6136/live`，串流金鑰填 `demo`（即 channel id）。
 
 可同時推多路，例如另一路用 `…/live/demo2`。
 

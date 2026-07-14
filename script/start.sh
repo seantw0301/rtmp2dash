@@ -40,19 +40,19 @@ resolve_bin() {
 # Read dash/rtmp ports from YAML (falls back to defaults).
 read_ports() {
   local dash_port=8080
-  local rtmp_port=1935
+  local rtmp_port=6136
   if [[ -f "$CONFIG" ]] && command -v python3 >/dev/null 2>&1; then
     eval "$(
       python3 - "$CONFIG" <<'PY'
 import sys
 path = sys.argv[1]
-dash, rtmp = 8080, 1935
+dash, rtmp = 8080, 6136
 try:
     import yaml  # type: ignore
     with open(path) as f:
         doc = yaml.safe_load(f) or {}
     dash = int(((doc.get("dash") or {}).get("port")) or 8080)
-    rtmp = int(((doc.get("rtmp") or {}).get("port")) or 1935)
+    rtmp = int(((doc.get("rtmp") or {}).get("port")) or 6136)
 except Exception:
     text = open(path).read().splitlines()
     section = None

@@ -41,5 +41,5 @@ echo "  start:  ${PREFIX}/start.sh"
 echo "  stop:   ${PREFIX}/stop.sh"
 echo "  config: ${PREFIX}/config.yaml"
 echo
-echo "Publish: rtmp://<host>:1935/live/<channel>"
+echo "Publish: rtmp://<host>:6136/live/<channel>"
 echo "Play:    http://<host>:8080/live/<channel>/index.mpd"

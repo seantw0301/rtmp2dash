@@ -12,7 +12,7 @@ CONFIG=/path/to/config.yaml ./script/start.sh
 ```yaml
 rtmp:
   listen: "0.0.0.0"
-  port: 1935
+  port: 6136
   app: "live"          # 本機推流 app 名稱
 
 dash:
@@ -23,7 +23,7 @@ cache:
   dir: "./cache"
   segment_duration_secs: 2
   window_segments: 90
-  # 逾時刪除 seg_*.m4s / index.mpd（依 mtime）。init.mp4 永不清理。
+  # 逾時刪除 seg_*.m4s（依 mtime）。init.mp4 與 index.mpd 永不由 janitor 清理。
   # 未設定時預設為 max(30, window_segments * segment_duration_secs * 2)
   # ttl_secs: 60
   cleanup_interval_secs: 10
@@ -46,7 +46,7 @@ pull:
 | `dash.port` | 是 | — | DASH HTTP 埠 |
 | `cache.dir` | 是 | — | 輸出根目錄 |
 | `cache.segment_duration_secs` | 否 | `2` | 切片目標秒數（必須 > 0） |
-| `cache.window_segments` | 否 | `90` | 視窗內保留的 segment 數（約 3 分鐘＠2s） |
+| `cache.window_segments` | 否 | `90` | 視窗內保留的 segment 數（約 3 分鐘＠2s）；磁碟多留 2 片 grace |
 | `cache.ttl_secs` | 否 | 自動 | 背景清理過期檔案的秒數（不得低於 live 視窗）；**不含 `init.mp4`** |
 | `cache.cleanup_interval_secs` | 否 | `10` | janitor 掃描間隔 |
 | `pull` | 否 | `[]` | 遠端 RTMP 拉流列表 |
@@ -62,7 +62,7 @@ pull:
 
 | 方向 | URL |
 |------|-----|
-| 推流 | `rtmp://<host>:1935/live/<channel>` |
+| 推流 | `rtmp://<host>:6136/live/<channel>` |
 | 播放 | `http://<host>:8080/live/<channel>/index.mpd` |
 
 ### 遠端拉流（pull）範例

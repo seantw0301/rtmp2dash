@@ -34,9 +34,9 @@ ffmpeg -y -hide_banner -loglevel error \
 echo "[2/5] start rtmp2dash..."
 "$START"
 
-echo "[3/5] publish rtmp://127.0.0.1:1935/live/${CHANNEL} ..."
+echo "[3/5] publish rtmp://127.0.0.1:6136/live/${CHANNEL} ..."
 ffmpeg -hide_banner -loglevel error -re -i "$SAMPLE" -c copy -f flv \
-  "rtmp://127.0.0.1:1935/live/${CHANNEL}"
+  "rtmp://127.0.0.1:6136/live/${CHANNEL}"
 
 echo "[4/5] verify DASH output..."
 code="$(curl -sS -o /tmp/rtmp2dash-smoke.mpd -w '%{http_code}' "$DASH_URL" || true)"

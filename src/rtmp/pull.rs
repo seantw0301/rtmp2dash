@@ -65,6 +65,10 @@ async fn run_one(cfg: Arc<Config>, channels: ChannelManager, src: PullSource) {
 }
 
 /// Keep pulling a remote RTMP source under an exclusive channel lease, reconnecting on failure.
+///
+/// The DASH packager (and its CMAF segmenter) lives for the entire lease so tfdt / moof
+/// sequence numbers stay continuous across brief origin blips. Codec config re-sent after
+/// reconnect is ignored when identical; a true config change rotates the generation.
 async fn run_with_lease(cfg: Arc<Config>, src: PullSource, lease: Arc<ChannelLease>) {
     info!(
         channel = %src.channel,
@@ -75,12 +79,29 @@ async fn run_with_lease(cfg: Arc<Config>, src: PullSource, lease: Arc<ChannelLea
         src.channel
     );
 
+    let dir = match ChannelManager::ensure_channel_dir(&cfg, &src.channel) {
+        Ok(d) => d,
+        Err(err) => {
+            error!(channel = %src.channel, "ensure channel dir failed: {err:#}");
+            return;
+        }
+    };
+    let mut packager = match DashPackager::resume(dir, &cfg.cache) {
+        Ok(p) => p,
+        Err(err) => {
+            error!(channel = %src.channel, "packager init failed: {err:#}");
+            return;
+        }
+    };
+
     let reconnect = Duration::from_secs(src.reconnect_secs.max(1));
     loop {
-        match pull_session(Arc::clone(&cfg), &src, Arc::clone(&lease)).await {
+        match pull_session(&src, Arc::clone(&lease), &mut packager).await {
             Ok(()) => warn!(channel = %src.channel, "pull session ended"),
             Err(err) => warn!(channel = %src.channel, "pull session error: {err:#}"),
         }
+        // Flush trailing media of this session but keep the segmenter/writer alive.
+        packager.flush_tail();
         info!(
             channel = %src.channel,
             secs = reconnect.as_secs(),
@@ -92,9 +113,9 @@ async fn run_with_lease(cfg: Arc<Config>, src: PullSource, lease: Arc<ChannelLea
 
 /// Connect to one remote RTMP URL, handshake, play the stream, and package DASH until disconnect.
 async fn pull_session(
-    cfg: Arc<Config>,
     src: &PullSource,
     _lease: Arc<ChannelLease>,
+    packager: &mut DashPackager,
 ) -> Result<()> {
     let parsed = src.parse_url()?;
     let addr = format!("{}:{}", parsed.host, parsed.port);
@@ -154,8 +175,6 @@ async fn pull_session(
     let connect_result = session.request_connection(parsed.app.clone())?;
     write_one(&mut socket, &connect_result).await?;
 
-    let dir = ChannelManager::ensure_channel_dir(&cfg, &src.channel)?;
-    let mut packager = DashPackager::new(dir, &cfg.cache)?;
     let mut demux = FlvDemux::new();
 
     let mut connected = false;
@@ -167,7 +186,7 @@ async fn pull_session(
             &mut socket,
             &mut session,
             &mut demux,
-            &mut packager,
+            packager,
             &parsed.stream_key,
             &mut connected,
             &mut playing,
@@ -196,7 +215,7 @@ async fn pull_session(
             &mut socket,
             &mut session,
             &mut demux,
-            &mut packager,
+            packager,
             &parsed.stream_key,
             &mut connected,
             &mut playing,
@@ -208,7 +227,6 @@ async fn pull_session(
     for au in demux.flush() {
         let _ = packager.handle_au(au);
     }
-    packager.finish();
     Ok(())
 }
 

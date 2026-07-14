@@ -39,7 +39,7 @@ http_ready() {
 
 # Best-effort port from config.
 DASH_PORT=8080
-RTMP_PORT=1935
+RTMP_PORT=6136
 if [[ -f "$CONFIG" ]]; then
   dash_line="$(awk '/^dash:/{s=1;next} s&&/^[^ \t]/{s=0} s&&/port:/{print $2;exit}' "$CONFIG" 2>/dev/null || true)"
   rtmp_line="$(awk '/^rtmp:/{s=1;next} s&&/^[^ \t]/{s=0} s&&/port:/{print $2;exit}' "$CONFIG" 2>/dev/null || true)"
