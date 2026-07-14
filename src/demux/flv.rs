@@ -82,7 +82,7 @@ impl FlvDemux {
                 if payload.is_empty() {
                     return Ok(vec![]);
                 }
-                let record = match AVCDecoderConfigurationRecord::parse(payload) {
+                let record = match parse_avc_decoder_config(payload) {
                     Ok(r) => r,
                     Err(e) => {
                         warn!("avcC parse failed (skipped): {e}");
@@ -222,6 +222,53 @@ impl FlvDemux {
     }
 }
 
+/// ISO high-profile ids that require the avcC chroma/bit-depth trailer.
+fn is_high_avc_profile(profile: u8) -> bool {
+    matches!(profile, 100 | 110 | 122 | 244)
+}
+
+/// Default High-profile avcC trailer: chroma=4:2:0, 8-bit, no SPSExt.
+/// Many soft-x264 RTMP publishers omit these bytes even though profile is High.
+const DEFAULT_HIGH_PROFILE_AVCC_EXT: [u8; 4] = [0xFC | 0x01, 0xF8, 0xF8, 0x00];
+
+/// Parse `avcC`, tolerating High-profile records that omit the ISO extension.
+///
+/// Strict `transmux` parsing fails with e.g.
+/// `buffer too short … (while parsing chroma_format byte)` when x264 soft
+/// encode ships High (100) without the 4-byte chroma/bit-depth trailer.
+/// NVENC publishers usually include a complete/correct trailer, so they work.
+fn parse_avc_decoder_config(payload: &[u8]) -> std::result::Result<AVCDecoderConfigurationRecord, transmux::Error> {
+    match AVCDecoderConfigurationRecord::parse(payload) {
+        Ok(r) => Ok(r),
+        Err(first_err) => {
+            if payload.len() < 2 || !is_high_avc_profile(payload[1]) {
+                return Err(first_err);
+            }
+            let msg = first_err.to_string();
+            let truncated_ext = msg.contains("chroma_format")
+                || msg.contains("bit_depth_luma")
+                || msg.contains("bit_depth_chroma")
+                || msg.contains("numOfSequenceParameterSetExt");
+            if !truncated_ext {
+                return Err(first_err);
+            }
+            let mut padded = payload.to_vec();
+            padded.extend_from_slice(&DEFAULT_HIGH_PROFILE_AVCC_EXT);
+            match AVCDecoderConfigurationRecord::parse(&padded) {
+                Ok(r) => {
+                    warn!(
+                        profile = payload[1],
+                        orig_len = payload.len(),
+                        "avcC missing high-profile extension; padded 4:2:0/8-bit defaults (x264 soft RTMP)"
+                    );
+                    Ok(r)
+                }
+                Err(_) => Err(first_err),
+            }
+        }
+    }
+}
+
 /// Read a signed 24-bit big-endian integer (composition time offset).
 fn read_si24(b: &[u8]) -> i32 {
     let raw = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
@@ -307,6 +354,44 @@ mod tests {
         assert_eq!(sample.data, payload);
         assert!(!sample.data.is_empty());
         assert!(sample.is_sync);
+    }
+
+    #[test]
+    fn high_profile_avcc_without_extension_is_tolerated() {
+        // Mimic soft-x264 RTMP: High (100) + SPS/PPS, no chroma/bit-depth trailer.
+        let mut body = vec![
+            0x01,        // configurationVersion
+            0x64,        // High profile
+            0x00,        // compatibility
+            0x1F,        // level 3.1
+            0xFC | 0x03, // lengthSizeMinusOne=3
+            0xE0 | 0x01, // numSPS=1
+        ];
+        let sps = vec![0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9];
+        body.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        body.extend_from_slice(&sps);
+        body.push(0x01); // numPPS
+        let pps = vec![0x68, 0xEB, 0xE3, 0xCB];
+        body.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        body.extend_from_slice(&pps);
+
+        assert!(
+            AVCDecoderConfigurationRecord::parse(&body).is_err(),
+            "strict parse must fail without high-profile ext"
+        );
+        let record = parse_avc_decoder_config(&body).expect("tolerant parse");
+        assert_eq!(record.profile_indication, 100);
+        assert_eq!(record.chroma_format, Some(1));
+        assert_eq!(record.bit_depth_luma_minus8, Some(0));
+        assert_eq!(record.sps.len(), 1);
+        assert_eq!(record.pps.len(), 1);
+
+        // FLV sequence header path should emit VideoConfig.
+        let mut tag = vec![0x17, 0x00, 0x00, 0x00, 0x00];
+        tag.extend_from_slice(&body);
+        let mut demux = FlvDemux::new();
+        let aus = demux.push_video(&tag, 0).unwrap();
+        assert!(matches!(aus[0], AccessUnit::VideoConfig { .. }));
     }
 }
 
