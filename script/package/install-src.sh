@@ -61,14 +61,26 @@ fi
 mkdir -p "${PREFIX}/bin" "${PREFIX}/cache" "${PREFIX}/logs"
 
 install -m 755 "$BIN_SRC" "${PREFIX}/bin/rtmp2dash"
-install -m 755 "${PKG_ROOT}/start.sh" "${PREFIX}/start.sh"
-install -m 755 "${PKG_ROOT}/stop.sh" "${PREFIX}/stop.sh"
+
+# When PREFIX == PKG_ROOT (in-place Ubuntu pack), start/stop are already here —
+# GNU install refuses "same file" copies.
+if [[ "$PREFIX" != "$PKG_ROOT" ]]; then
+  install -m 755 "${PKG_ROOT}/start.sh" "${PREFIX}/start.sh"
+  install -m 755 "${PKG_ROOT}/stop.sh" "${PREFIX}/stop.sh"
+else
+  chmod +x "${PREFIX}/start.sh" "${PREFIX}/stop.sh"
+fi
 
 if [[ -f "${PREFIX}/config.yaml" ]]; then
   echo "  keeping existing config: ${PREFIX}/config.yaml"
-else
-  install -m 644 "${PKG_ROOT}/config.yaml" "${PREFIX}/config.yaml"
+elif [[ -f "${PKG_ROOT}/config.yaml" ]]; then
+  if [[ "$PREFIX" != "$PKG_ROOT" ]]; then
+    install -m 644 "${PKG_ROOT}/config.yaml" "${PREFIX}/config.yaml"
+  fi
   echo "  installed config: ${PREFIX}/config.yaml"
+elif [[ -f "${PKG_ROOT}/config.example.yaml" ]]; then
+  install -m 644 "${PKG_ROOT}/config.example.yaml" "${PREFIX}/config.yaml"
+  echo "  installed config from example: ${PREFIX}/config.yaml"
 fi
 
 echo

@@ -1,6 +1,8 @@
 use crate::config::CacheConfig;
+use crate::dash::av_skew;
 use crate::dash::fmp4_duration::{first_tfdt_base_time, first_traf_duration_ticks};
 use crate::dash::mpd::{self, MpdTrackInfo, TimelineEntry};
+use crate::dash::origin_metrics;
 use crate::dash::writer::{clear_channel_dir, PackagerWriter};
 use crate::demux::{AccessUnit, AUDIO_TRACK_ID, TIMESCALE, VIDEO_TRACK_ID};
 use anyhow::Result;
@@ -8,6 +10,7 @@ use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use transmux::{CodecConfig, Sample, Segmenter, TrackSpec};
 
@@ -43,17 +46,33 @@ pub struct DashPackager {
     started_on_video_sync: bool,
     /// Coalesce MPD rewrites to at most once per `drain_ready` batch.
     mpd_dirty: bool,
+    /// Consecutive segments outside [1.5, 2.5]s for degraded detection.
+    consecutive_out_of_tolerance: u32,
+    /// Latched once when this packager crosses the degraded streak.
+    degraded: bool,
+    /// Max |audio−video| `tfdt` (ms) before rotating the CMAF generation.
+    av_tfdt_max_skew_ms: u64,
+    /// Minimum wall interval between on-disk skew timer checks.
+    av_tfdt_check_interval: Duration,
+    /// Last time [`Self::check_av_skew_on_disk`] ran.
+    last_av_skew_check: Option<Instant>,
+    /// `Period@id` for the current CMAF generation. Bumped on every wipe/rotate
+    /// so source/edge can purge when segment numbers intentionally continue.
+    period_id: u64,
 }
 
 impl DashPackager {
-    /// Create a packager for a fresh publish: clear leftover cache files and start at seg 1.
+    /// Create a packager that wipes the channel dir and restarts at seg 1.
+    /// Prefer [`Self::resume`] for live publish/pull so downstream does not see a
+    /// segment-number regression on every publisher reconnect.
     pub fn new(out_dir: PathBuf, cache: &CacheConfig) -> Result<Self> {
         Self::create(out_dir, cache, /*clear=*/ true)
     }
 
-    /// Create a packager after process restart for RTMP pull: continue numbering but wipe
-    /// leftover segments/MPD. A brand-new Segmenter always starts tfdt at 0, so old media
-    /// files are never compatible with a new init — keeping them would desync playback.
+    /// Continue segment numbering from on-disk `seg_*.m4s`, but wipe leftover media.
+    /// A brand-new Segmenter always starts tfdt at 0, so prior fragments are never
+    /// compatible with a new init — keeping them would desync playback. Continuing
+    /// the number space avoids false "generation reset" tears on trans `/mpegts`.
     pub fn resume(out_dir: PathBuf, cache: &CacheConfig) -> Result<Self> {
         Self::create(out_dir, cache, /*clear=*/ false)
     }
@@ -75,6 +94,7 @@ impl DashPackager {
             next
         };
         let writer = PackagerWriter::spawn(out_dir.clone());
+        let period_id = next_period_id(0);
 
         Ok(Self {
             out_dir,
@@ -93,7 +113,18 @@ impl DashPackager {
             pending_sample_bytes: 0,
             started_on_video_sync: false,
             mpd_dirty: false,
+            consecutive_out_of_tolerance: 0,
+            degraded: false,
+            av_tfdt_max_skew_ms: cache.av_tfdt_max_skew_ms.max(1),
+            av_tfdt_check_interval: Duration::from_secs(cache.av_tfdt_check_interval_secs.max(1)),
+            last_av_skew_check: None,
+            period_id,
         })
+    }
+
+    /// Advance [`Self::period_id`] so the next MPD advertises a new Period.
+    fn bump_period_id(&mut self) {
+        self.period_id = next_period_id(self.period_id);
     }
 
     /// Ingest one access unit (codec config or sample) into the live DASH pipeline.
@@ -137,12 +168,57 @@ impl DashPackager {
             }
             AccessUnit::VideoSample(sample) => self.push_sample(VIDEO_TRACK_ID, sample),
             AccessUnit::AudioSample(sample) => self.push_sample(AUDIO_TRACK_ID, sample),
+            AccessUnit::TimelineDiscontinuity { track, gap_ms } => {
+                warn!(
+                    dir = %self.out_dir.display(),
+                    track,
+                    gap_ms,
+                    "RTMP DTS discontinuity — rotating DASH generation to realign A/V tfdt"
+                );
+                av_skew::record_correction();
+                self.rotate();
+            }
         }
         Ok(())
     }
 
+    /// Periodic timer: re-read the newest on-disk `seg_*.m4s` and rotate if A/V
+    /// `tfdt` skew exceeds tolerance (safety net beside per-fragment checks).
+    pub fn check_av_skew_on_disk(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_av_skew_check
+            .is_some_and(|t| now.duration_since(t) < self.av_tfdt_check_interval)
+        {
+            return;
+        }
+        self.last_av_skew_check = Some(now);
+        let Some(path) = newest_segment_path(&self.out_dir) else {
+            return;
+        };
+        let Ok(bytes) = fs::read(&path) else {
+            return;
+        };
+        let Some(bases) = av_skew::parse_av_tfdt_ms(&bytes) else {
+            return;
+        };
+        let skew = bases.skew_ms();
+        if av_skew::exceeds_tolerance(skew, self.av_tfdt_max_skew_ms) {
+            warn!(
+                dir = %self.out_dir.display(),
+                segment = %path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                skew_ms = skew,
+                video_tfdt_ms = bases.video_ms,
+                audio_tfdt_ms = bases.audio_ms,
+                max_ms = self.av_tfdt_max_skew_ms,
+                "on-disk A/V tfdt skew exceeds tolerance — rotating DASH generation"
+            );
+            av_skew::record_correction();
+            self.rotate();
+        }
+    }
+
     /// Flush buffered media into the current generation without shutting the writer.
-    /// Used across pull reconnects so the same Segmenter (tfdt / moof seq) stays alive.
     pub fn flush_tail(&mut self) {
         if let Some(seg) = self.segmenter.as_mut() {
             if let Err(err) = seg.flush() {
@@ -157,6 +233,52 @@ impl DashPackager {
     pub async fn finish(&mut self) {
         self.flush_tail();
         self.writer.shutdown_and_drain().await;
+    }
+
+    /// Reset after a pull RTMP session ends so the next session can recover cleanly.
+    ///
+    /// Origin restarts reuse the same codec ids but open a **new** CMAF timeline
+    /// (`tfdt` from 0, new init). Keeping the previous Segmenter across reconnect
+    /// left a frozen `index.mpd` while janitor deleted the segments (ghost MPD).
+    ///
+    /// This drops the live generation (in-memory + on disk), clears codec configs
+    /// so we wait for fresh SPS/PPS + ASC, and keeps segment numbering.
+    pub async fn prepare_for_reconnect(&mut self) {
+        if let Some(seg) = self.segmenter.as_mut() {
+            let _ = seg.flush();
+            // Discard — old fragments must not pair with the next init.
+            let _ = seg.take_ready();
+        }
+        self.segmenter = None;
+        self.video_config = None;
+        self.audio_config = None;
+        self.pending_samples.clear();
+        self.pending_sample_bytes = 0;
+        self.started_on_video_sync = false;
+        self.mpd_dirty = false;
+        self.availability_start_time = None;
+        self.timeline.clear();
+        self.next_start_ticks = 0;
+        self.window_start = self.next_segment_number;
+        self.bump_period_id();
+
+        // Drain any already-queued writes, then sync-wipe so a late MPD cannot
+        // survive past this reset (avoids ghost manifests after origin restart).
+        self.writer.shutdown_and_drain().await;
+        if let Err(err) = wipe_channel_media(&self.out_dir) {
+            warn!(
+                dir = %self.out_dir.display(),
+                "wipe after pull/publish disconnect failed: {err:#}"
+            );
+        }
+        self.writer = PackagerWriter::spawn(self.out_dir.clone());
+
+        info!(
+            dir = %self.out_dir.display(),
+            next_segment = self.next_segment_number,
+            period_id = self.period_id,
+            "DASH packager reset after disconnect (awaiting new codec configs)"
+        );
     }
 
     /// Start the CMAF segmenter once both video and audio codec configs are known.
@@ -176,7 +298,8 @@ impl DashPackager {
 
     /// Tear down the current generation and start a new one with the current codec configs.
     /// Segment numbers continue; old media + MPD are removed so clients never pair a new
-    /// init.mp4 with leftover segments.
+    /// init.mp4 with leftover segments. [`Self::period_id`] advances so downstream can
+    /// detect the silent numbering continue.
     fn rotate(&mut self) {
         if let Some(seg) = self.segmenter.as_mut() {
             let _ = seg.flush();
@@ -194,6 +317,13 @@ impl DashPackager {
         self.timeline.clear();
         self.next_start_ticks = 0;
         self.window_start = self.next_segment_number;
+        self.bump_period_id();
+        info!(
+            dir = %self.out_dir.display(),
+            period_id = self.period_id,
+            next_segment = self.next_segment_number,
+            "DASH generation rotated"
+        );
 
         let (Some(video), Some(audio)) = (self.video_config.clone(), self.audio_config.clone())
         else {
@@ -328,6 +458,25 @@ impl DashPackager {
         let fallback_ticks = (self.segment_duration_secs * 1000.0).round().max(1.0) as u64;
         for media in ready {
             let number = self.next_segment_number;
+            if let Some(bases) = av_skew::parse_av_tfdt_ms(&media) {
+                let skew = bases.skew_ms();
+                if av_skew::exceeds_tolerance(skew, self.av_tfdt_max_skew_ms) {
+                    warn!(
+                        dir = %self.out_dir.display(),
+                        segment = number,
+                        skew_ms = skew,
+                        video_tfdt_ms = bases.video_ms,
+                        audio_tfdt_ms = bases.audio_ms,
+                        max_ms = self.av_tfdt_max_skew_ms,
+                        "fragment A/V tfdt skew exceeds tolerance — discarding batch and rotating"
+                    );
+                    av_skew::record_correction();
+                    // Drop any further ready fragments from the poisoned segmenter.
+                    let _ = self.segmenter.as_mut().map(|s| s.take_ready());
+                    self.rotate();
+                    return;
+                }
+            }
             let duration_ticks = first_traf_duration_ticks(&media).unwrap_or(fallback_ticks).max(1);
             let start_ticks = first_tfdt_base_time(&media).unwrap_or(self.next_start_ticks);
             self.next_start_ticks = start_ticks.saturating_add(duration_ticks);
@@ -339,6 +488,18 @@ impl DashPackager {
                 duration_ticks,
             });
             debug!(segment = number, start_ticks, duration_ticks, "queued media segment");
+            if origin_metrics::record_segment_duration_ticks(
+                duration_ticks,
+                &mut self.consecutive_out_of_tolerance,
+            ) && !self.degraded
+            {
+                self.degraded = true;
+                warn!(
+                    segment = number,
+                    duration_ticks,
+                    "channel segment duration degraded (consecutive out of [1.5, 2.5]s)"
+                );
+            }
             self.next_segment_number = self.next_segment_number.saturating_add(1);
             self.mpd_dirty = true;
         }
@@ -386,8 +547,22 @@ impl DashPackager {
             .get_or_insert_with(|| mpd::availability_start_for_live_edge(Utc::now(), &entries));
         let video = MpdTrackInfo::from_video(video_cfg);
         let audio = MpdTrackInfo::from_audio(audio_cfg);
-        let xml = mpd::render_live_mpd(&entries, ast, &video, Some(&audio));
+        let period = self.period_id.to_string();
+        let xml = mpd::render_live_mpd(&entries, ast, &video, Some(&audio), &period);
         self.writer.enqueue("index.mpd", xml.into_bytes());
+    }
+}
+
+/// Monotonic-ish Period@id: wall-clock seconds, or `current+1` when the clock
+/// has not advanced (rapid rotates within the same second).
+fn next_period_id(current: u64) -> u64 {
+    let now = Utc::now().timestamp().max(1) as u64;
+    if current == 0 {
+        now
+    } else if now <= current {
+        current.saturating_add(1)
+    } else {
+        now
     }
 }
 
@@ -430,6 +605,26 @@ fn codec_config_eq(a: &CodecConfig, b: &CodecConfig) -> bool {
         ) => ea == eb && ca == cb && ra == rb && sa == sb,
         _ => false,
     }
+}
+
+/// Newest `seg_*.m4s` by segment number (not mtime).
+fn newest_segment_path(out_dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(u64, PathBuf)> = None;
+    let entries = fs::read_dir(out_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(num) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(parse_seg_number)
+        else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(n, _)| num > *n) {
+            best = Some((num, path));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Highest remaining `seg_N.m4s` number + 1, or 1 when the directory is empty.
@@ -480,12 +675,26 @@ fn parse_seg_number(name: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ReencodeProfile;
     use tempfile::tempdir;
     use transmux::{
         AVCConfigurationBox, AVCDecoderConfigurationRecord, EsdsBox,
         ESDescriptor, DecoderConfigDescriptor, DecoderSpecificInfo, ObjectTypeIndication,
         SLConfigDescriptor, StreamType,
     };
+
+    fn test_cache(dir: &Path) -> CacheConfig {
+        CacheConfig {
+            dir: dir.to_path_buf(),
+            segment_duration_secs: 2.0,
+            window_segments: 90,
+            ttl_secs: None,
+            cleanup_interval_secs: 10,
+            reencode_profile: ReencodeProfile::Off,
+            av_tfdt_max_skew_ms: 500,
+            av_tfdt_check_interval_secs: 2,
+        }
+    }
 
     fn fake_avc(profile: u8, width: u16, height: u16) -> CodecConfig {
         // Minimal avcC with distinct profile so equality tests can differ.
@@ -565,13 +774,7 @@ mod tests {
         fs::write(dir.path().join("index.mpd"), b"stale").unwrap();
         fs::write(dir.path().join("init.mp4"), b"old").unwrap();
 
-        let cache = CacheConfig {
-            dir: dir.path().to_path_buf(),
-            segment_duration_secs: 2.0,
-            window_segments: 90,
-            ttl_secs: None,
-            cleanup_interval_secs: 10,
-        };
+        let cache = test_cache(dir.path());
         // PackagerWriter::spawn needs a runtime.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -612,13 +815,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotate_purges_old_segments_and_continues_numbering() {
         let dir = tempdir().unwrap();
-        let cache = CacheConfig {
-            dir: dir.path().to_path_buf(),
-            segment_duration_secs: 2.0,
-            window_segments: 90,
-            ttl_secs: None,
-            cleanup_interval_secs: 10,
-        };
+        let cache = test_cache(dir.path());
         let mut packager = DashPackager::new(dir.path().to_path_buf(), &cache).unwrap();
         packager.video_config = Some(fake_avc(0x4D, 640, 360));
         packager.audio_config = Some(fake_aac(44100));
@@ -639,6 +836,7 @@ mod tests {
         fs::write(dir.path().join("seg_49.m4s"), b"old49").unwrap();
         fs::write(dir.path().join("index.mpd"), b"stale-mpd").unwrap();
 
+        let period_before = packager.period_id;
         packager.video_config = Some(fake_avc(0x42, 640, 360));
         packager.rotate();
 
@@ -646,6 +844,7 @@ mod tests {
         packager.finish().await;
 
         assert_eq!(packager.next_segment_number, 50);
+        assert!(packager.period_id > period_before);
         assert!(packager.timeline.is_empty());
         assert!(!dir.path().join("seg_48.m4s").exists());
         assert!(!dir.path().join("seg_49.m4s").exists());
@@ -655,15 +854,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepare_for_reconnect_wipes_generation_and_keeps_numbering() {
+        let dir = tempdir().unwrap();
+        let cache = test_cache(dir.path());
+        let mut packager = DashPackager::new(dir.path().to_path_buf(), &cache).unwrap();
+        packager.video_config = Some(fake_avc(0x4D, 640, 360));
+        packager.audio_config = Some(fake_aac(44100));
+        packager.next_segment_number = 50;
+        packager.window_start = 48;
+        packager.timeline.push_back(TimelineEntry {
+            number: 48,
+            start_ticks: 94_000,
+            duration_ticks: 2000,
+        });
+        packager.timeline.push_back(TimelineEntry {
+            number: 49,
+            start_ticks: 96_000,
+            duration_ticks: 2000,
+        });
+        fs::write(dir.path().join("seg_48.m4s"), b"old48").unwrap();
+        fs::write(dir.path().join("seg_49.m4s"), b"old49").unwrap();
+        fs::write(dir.path().join("index.mpd"), b"stale-mpd").unwrap();
+        fs::write(dir.path().join("init.mp4"), b"old-init").unwrap();
+
+        packager.prepare_for_reconnect().await;
+
+        assert_eq!(packager.next_segment_number, 50);
+        assert!(packager.timeline.is_empty());
+        assert!(packager.video_config.is_none());
+        assert!(packager.audio_config.is_none());
+        assert!(packager.segmenter.is_none());
+        assert!(!dir.path().join("seg_48.m4s").exists());
+        assert!(!dir.path().join("seg_49.m4s").exists());
+        assert!(!dir.path().join("index.mpd").exists());
+        assert!(!dir.path().join("init.mp4").exists());
+
+        // Fresh configs from the next RTMP session start a new generation.
+        packager
+            .handle_au(AccessUnit::VideoConfig {
+                config: fake_avc(0x4D, 640, 360),
+            })
+            .unwrap();
+        packager
+            .handle_au(AccessUnit::AudioConfig {
+                config: fake_aac(44100),
+            })
+            .unwrap();
+        assert!(packager.segmenter.is_some());
+        packager.finish().await;
+        assert!(dir.path().join("init.mp4").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn identical_config_resent_does_not_rotate() {
         let dir = tempdir().unwrap();
-        let cache = CacheConfig {
-            dir: dir.path().to_path_buf(),
-            segment_duration_secs: 2.0,
-            window_segments: 90,
-            ttl_secs: None,
-            cleanup_interval_secs: 10,
-        };
+        let cache = test_cache(dir.path());
         let mut packager = DashPackager::new(dir.path().to_path_buf(), &cache).unwrap();
         let video = fake_avc(0x4D, 640, 360);
         let audio = fake_aac(44100);

@@ -272,6 +272,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "cmaf-origin"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "transmux",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -956,6 +964,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtcp-packet"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd9ac18b3ac76ba87c7c233c176fb701ae916baacf8737a969520ab17869e97d"
+dependencies = [
+ "broadcast-common",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rtmp2dash"
 version = "0.1.0"
 dependencies = [
@@ -965,6 +984,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "cmaf-origin",
  "dashmap",
  "http",
  "rml_rtmp",
@@ -978,6 +998,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "transmux",
+]
+
+[[package]]
+name = "rtp-packet"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb848db1e1cda932de4db5a50bc991fda56d6b59c80e11adfa24c51494ff959e"
+dependencies = [
+ "broadcast-common",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1399,9 +1429,9 @@ dependencies = [
 
 [[package]]
 name = "transmux"
-version = "0.15.2"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd7e47a964db662d463b3b15aeba03b7182b69abe64c65068d03a454cfcf0e51"
+checksum = "81987ba2e336bb64cabc9914f47fb26e3f62837e82f06801bbb95da1aee80896"
 dependencies = [
  "aes",
  "broadcast-common",
@@ -1410,6 +1440,8 @@ dependencies = [
  "mpeg-pes",
  "mpeg-ps",
  "mpeg-ts",
+ "rtcp-packet",
+ "rtp-packet",
  "serde",
  "thiserror 2.0.18",
 ]

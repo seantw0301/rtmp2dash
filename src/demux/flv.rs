@@ -25,6 +25,25 @@ const AUDIO_SAMPLE_SIZE_BITS: u16 = 16;
 /// Cap on a single NALU / AAC frame payload we will buffer (bytes).
 const MAX_SAMPLE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Max RTMP DTS delta (ms) accepted as a normal sample duration.
+///
+/// Larger gaps (encoder stall, timestamp reset, or one-track discontinuity) used
+/// to be **clamped** to the default frame duration. That under-counted one track
+/// while the other kept accumulating real time — producing multi-minute A/V
+/// `tfdt` skew (seen on ubn/ubnbus). Emit [`AccessUnit::TimelineDiscontinuity`]
+/// instead so the packager rotates to a fresh CMAF generation.
+///
+/// Also treat true DTS rewinds (`dts < prev`) as discontinuities even when the
+/// wrapping delta would otherwise look like a huge forward jump — encoder
+/// restarts often reset one track a few hundred ms before the other.
+const MAX_SAMPLE_GAP_MS: u32 = 5_000;
+
+/// Single-track DTS jump above this (ms) while the other track has not jumped
+/// with it is treated as a discontinuity — even when below [`MAX_SAMPLE_GAP_MS`].
+/// Independent duration accumulation would otherwise bake a permanent A/V tfdt
+/// offset into the CMAF generation.
+const MAX_ASYM_JUMP_MS: u32 = 1_000;
+
 /// Media timescale used for FLV/RTMP timestamps (milliseconds).
 pub const TIMESCALE: u32 = 1000;
 
@@ -37,6 +56,12 @@ pub enum AccessUnit {
     AudioConfig { config: CodecConfig },
     VideoSample(Sample),
     AudioSample(Sample),
+    /// RTMP DTS jumped or rewound beyond [`MAX_SAMPLE_GAP_MS`] on one track.
+    /// Packager must rotate so A/V `tfdt` timelines stay aligned.
+    TimelineDiscontinuity {
+        track: &'static str,
+        gap_ms: u32,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -45,6 +70,17 @@ pub struct FlvDemux {
     pending_audio: Option<(Sample, u32)>,
     default_video_duration: u32,
     default_audio_duration: u32,
+    /// First RTMP DTS observed on each track in the current generation.
+    first_video_dts: Option<u32>,
+    first_audio_dts: Option<u32>,
+    /// `max(first_video, first_audio)` once both tracks have been seen.
+    /// Samples below this are dropped so both CMAF tracks start at the same
+    /// RTMP clock — Segmenter always begins `tfdt` at 0 per track, so a shared
+    /// epoch is required to avoid a permanent A/V offset after publisher restart.
+    sync_epoch_dts: Option<u32>,
+    /// Last finalized sample boundary DTS per track (for asymmetric jump checks).
+    last_video_dts: Option<u32>,
+    last_audio_dts: Option<u32>,
 }
 
 impl FlvDemux {
@@ -54,6 +90,38 @@ impl FlvDemux {
             default_video_duration: 33,
             default_audio_duration: 23,
             ..Self::default()
+        }
+    }
+
+    /// Clear A/V timeline state after a discontinuity so the next generation
+    /// re-seals a shared RTMP DTS epoch.
+    fn reset_timeline_clock(&mut self) {
+        self.first_video_dts = None;
+        self.first_audio_dts = None;
+        self.sync_epoch_dts = None;
+        self.last_video_dts = None;
+        self.last_audio_dts = None;
+    }
+
+    fn note_track_dts(&mut self, is_video: bool, dts_ms: u32) {
+        if is_video {
+            if self.first_video_dts.is_none() {
+                self.first_video_dts = Some(dts_ms);
+            }
+        } else if self.first_audio_dts.is_none() {
+            self.first_audio_dts = Some(dts_ms);
+        }
+        if self.sync_epoch_dts.is_none() {
+            if let (Some(v), Some(a)) = (self.first_video_dts, self.first_audio_dts) {
+                let epoch = v.max(a);
+                self.sync_epoch_dts = Some(epoch);
+                tracing::info!(
+                    sync_epoch_dts = epoch,
+                    first_video_dts = v,
+                    first_audio_dts = a,
+                    "sealed shared RTMP DTS epoch for A/V tfdt alignment"
+                );
+            }
         }
     }
 
@@ -187,39 +255,132 @@ impl FlvDemux {
 
     /// Buffer a video sample and finalize the previous one's duration from DTS delta.
     fn enqueue_video(&mut self, sample: Sample, dts_ms: u32) -> Vec<AccessUnit> {
-        let mut out = Vec::new();
-        if let Some((mut prev, prev_dts)) = self.pending_video.take() {
-            let dur = dts_ms.wrapping_sub(prev_dts);
-            let dur = if dur == 0 || dur > 5_000 {
-                self.default_video_duration.max(1)
-            } else {
-                dur
-            };
-            prev.duration = dur;
-            self.default_video_duration = dur;
-            out.push(AccessUnit::VideoSample(prev));
-        }
-        self.pending_video = Some((sample, dts_ms));
-        out
+        self.note_track_dts(true, dts_ms);
+        self.enqueue_sample(true, sample, dts_ms)
     }
 
     /// Buffer an audio sample and finalize the previous one's duration from DTS delta.
     fn enqueue_audio(&mut self, sample: Sample, dts_ms: u32) -> Vec<AccessUnit> {
+        self.note_track_dts(false, dts_ms);
+        self.enqueue_sample(false, sample, dts_ms)
+    }
+
+    fn enqueue_sample(&mut self, is_video: bool, sample: Sample, dts_ms: u32) -> Vec<AccessUnit> {
         let mut out = Vec::new();
-        if let Some((mut prev, prev_dts)) = self.pending_audio.take() {
-            let dur = dts_ms.wrapping_sub(prev_dts);
-            let dur = if dur == 0 || dur > 5_000 {
-                self.default_audio_duration.max(1)
+        let default = if is_video {
+            self.default_video_duration
+        } else {
+            self.default_audio_duration
+        };
+        let other_last = if is_video {
+            self.last_audio_dts
+        } else {
+            self.last_video_dts
+        };
+        let sync_epoch = self.sync_epoch_dts;
+
+        let prev_pair = if is_video {
+            self.pending_video.take()
+        } else {
+            self.pending_audio.take()
+        };
+        let Some((mut prev, prev_dts)) = prev_pair else {
+            if is_video {
+                self.pending_video = Some((sample, dts_ms));
             } else {
-                dur
-            };
-            prev.duration = dur;
-            self.default_audio_duration = dur;
-            out.push(AccessUnit::AudioSample(prev));
+                self.pending_audio = Some((sample, dts_ms));
+            }
+            return out;
+        };
+
+        match sample_duration_ms(dts_ms, prev_dts, default, other_last) {
+            Err(gap_ms) => {
+                let track = if is_video { "video" } else { "audio" };
+                warn!(
+                    gap_ms,
+                    prev_dts, dts_ms, track, "RTMP DTS discontinuity; requesting timeline rotate"
+                );
+                out.push(AccessUnit::TimelineDiscontinuity { track, gap_ms });
+                self.reset_timeline_clock();
+                // Drop the other track's pending — it belongs to the dead generation.
+                self.pending_video = None;
+                self.pending_audio = None;
+                self.note_track_dts(is_video, dts_ms);
+                if is_video {
+                    self.pending_video = Some((sample, dts_ms));
+                } else {
+                    self.pending_audio = Some((sample, dts_ms));
+                }
+            }
+            Ok(dur) => {
+                // Wait until both A/V have been seen so we can share one RTMP epoch.
+                let Some(epoch) = sync_epoch else {
+                    if is_video {
+                        self.pending_video = Some((sample, dts_ms));
+                    } else {
+                        self.pending_audio = Some((sample, dts_ms));
+                    }
+                    return out;
+                };
+                // Drop pre-epoch samples so both tracks' tfdt=0 map to the same DTS.
+                if prev_dts < epoch {
+                    if is_video {
+                        self.pending_video = Some((sample, dts_ms));
+                    } else {
+                        self.pending_audio = Some((sample, dts_ms));
+                    }
+                    return out;
+                }
+
+                prev.duration = dur;
+                if is_video {
+                    self.default_video_duration = dur;
+                    self.last_video_dts = Some(dts_ms);
+                    out.push(AccessUnit::VideoSample(prev));
+                    self.pending_video = Some((sample, dts_ms));
+                } else {
+                    self.default_audio_duration = dur;
+                    self.last_audio_dts = Some(dts_ms);
+                    out.push(AccessUnit::AudioSample(prev));
+                    self.pending_audio = Some((sample, dts_ms));
+                }
+            }
         }
-        self.pending_audio = Some((sample, dts_ms));
         out
     }
+}
+
+/// Compute sample duration from consecutive RTMP DTS values.
+///
+/// Returns `Err(gap_ms)` when the delta is a discontinuity (too large, a
+/// rewind, or an asymmetric single-track jump), instead of silently clamping.
+fn sample_duration_ms(
+    dts_ms: u32,
+    prev_dts: u32,
+    default: u32,
+    other_last_dts: Option<u32>,
+) -> Result<u32, u32> {
+    if dts_ms < prev_dts {
+        // Encoder / publisher restart often rewinds one track first.
+        return Err(prev_dts - dts_ms);
+    }
+    let dur = dts_ms - prev_dts;
+    if dur == 0 {
+        return Ok(default.max(1));
+    }
+    if dur > MAX_SAMPLE_GAP_MS {
+        return Err(dur);
+    }
+    // One track leaped forward while the other is still near `prev_dts`.
+    if dur > MAX_ASYM_JUMP_MS {
+        if let Some(other) = other_last_dts {
+            let ahead_of_other = dts_ms.saturating_sub(other);
+            if ahead_of_other > MAX_ASYM_JUMP_MS {
+                return Err(dur);
+            }
+        }
+    }
+    Ok(dur)
 }
 
 /// ISO high-profile ids that require the avcC chroma/bit-depth trailer.
@@ -343,13 +504,15 @@ mod tests {
         tag.extend_from_slice(&payload);
 
         let mut demux = FlvDemux::new();
+        // Prime audio so the shared RTMP epoch seals (both tracks required).
+        let _ = demux.push_audio(&[0xAF, 0x01, 0x11], 0).unwrap();
         let _ = demux.push_video(&tag, 0).unwrap();
         // Second frame finalizes the first sample's duration.
         let mut tag2 = vec![0x27, 0x01, 0x00, 0x00, 0x00];
         tag2.extend_from_slice(&payload);
         let aus = demux.push_video(&tag2, 33).unwrap();
         let AccessUnit::VideoSample(sample) = &aus[0] else {
-            panic!("expected video sample");
+            panic!("expected video sample, got {aus:?}");
         };
         assert_eq!(sample.data, payload);
         assert!(!sample.data.is_empty());
@@ -392,6 +555,105 @@ mod tests {
         let mut demux = FlvDemux::new();
         let aus = demux.push_video(&tag, 0).unwrap();
         assert!(matches!(aus[0], AccessUnit::VideoConfig { .. }));
+    }
+
+    #[test]
+    fn large_dts_gap_emits_timeline_discontinuity_not_clamped_duration() {
+        let nal = [0x65u8, 0x88, 0x84];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&nal);
+        let mut tag = vec![0x17, 0x01, 0x00, 0x00, 0x00];
+        tag.extend_from_slice(&payload);
+
+        let mut demux = FlvDemux::new();
+        let _ = demux.push_video(&tag, 0).unwrap();
+        // Jump >> MAX_SAMPLE_GAP_MS — old code clamped to ~33ms and poisoned tfdt.
+        let mut tag2 = vec![0x27, 0x01, 0x00, 0x00, 0x00];
+        tag2.extend_from_slice(&payload);
+        let aus = demux.push_video(&tag2, 10_000).unwrap();
+        assert!(
+            matches!(
+                aus.as_slice(),
+                [AccessUnit::TimelineDiscontinuity {
+                    track: "video",
+                    gap_ms: 10_000
+                }]
+            ),
+            "got {aus:?}"
+        );
+    }
+
+    #[test]
+    fn sample_duration_rejects_gaps_over_five_seconds() {
+        assert_eq!(sample_duration_ms(33, 0, 33, None), Ok(33));
+        assert_eq!(sample_duration_ms(100, 100, 33, None), Ok(33)); // zero delta → default
+        assert!(sample_duration_ms(6_000, 0, 33, None).is_err());
+    }
+
+    #[test]
+    fn sample_duration_rejects_dts_rewind() {
+        assert_eq!(sample_duration_ms(500, 1_000, 33, None), Err(500));
+    }
+
+    #[test]
+    fn sample_duration_rejects_asymmetric_jump_under_five_seconds() {
+        // 2s jump on this track while the other is still near the previous DTS.
+        assert_eq!(
+            sample_duration_ms(3_000, 1_000, 33, Some(1_020)),
+            Err(2_000)
+        );
+        // Both tracks jumped together — accept as a long (but <5s) frame.
+        assert_eq!(
+            sample_duration_ms(3_000, 1_000, 33, Some(2_900)),
+            Ok(2_000)
+        );
+    }
+
+    #[test]
+    fn shared_sync_epoch_drops_early_audio_so_av_start_aligned() {
+        let nal = [0x65u8, 0x88, 0x84];
+        let mut vpayload = Vec::new();
+        vpayload.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        vpayload.extend_from_slice(&nal);
+        let vtag = |dts: u32, key: bool| {
+            let mut tag = vec![if key { 0x17 } else { 0x27 }, 0x01, 0x00, 0x00, 0x00];
+            tag.extend_from_slice(&vpayload);
+            (tag, dts)
+        };
+        let atag = |dts: u32| (vec![0xAFu8, 0x01, 0x11, 0x22], dts);
+
+        let mut demux = FlvDemux::new();
+        // Video starts at 0; audio at 500 → epoch = 500.
+        let (t, d) = vtag(0, true);
+        let _ = demux.push_video(&t, d).unwrap();
+        let (t, d) = vtag(33, false);
+        assert!(
+            demux.push_video(&t, d).unwrap().is_empty(),
+            "hold video until audio seals epoch"
+        );
+        let (t, d) = atag(500);
+        let _ = demux.push_audio(&t, d).unwrap();
+        assert_eq!(demux.sync_epoch_dts, Some(500));
+
+        // Pre-epoch video must not emit; post-epoch pair should.
+        let (t, d) = vtag(500, true);
+        let _ = demux.push_video(&t, d).unwrap();
+        let (t, d) = vtag(533, false);
+        let aus = demux.push_video(&t, d).unwrap();
+        assert!(
+            aus.iter().any(|a| matches!(a, AccessUnit::VideoSample(_))),
+            "got {aus:?}"
+        );
+
+        let (t, d) = atag(523);
+        let _ = demux.push_audio(&t, d).unwrap();
+        let (t, d) = atag(546);
+        let aus = demux.push_audio(&t, d).unwrap();
+        assert!(
+            aus.iter().any(|a| matches!(a, AccessUnit::AudioSample(_))),
+            "got {aus:?}"
+        );
     }
 }
 

@@ -42,6 +42,39 @@ pub struct CacheConfig {
     /// How often the background janitor scans the cache (seconds). Default 10.
     #[serde(default = "default_cleanup_interval_secs")]
     pub cleanup_interval_secs: u64,
+    /// Opt-in re-encode for upstream GOP that cannot meet 2s keyframe cuts.
+    /// `off` (default) = passthrough; `force_2s_gop` = ffmpeg/libx264 keyint=fps×2.
+    #[serde(default = "default_reencode_profile")]
+    pub reencode_profile: ReencodeProfile,
+    /// Max |audio_tfdt − video_tfdt| (ms) before the packager rotates the CMAF
+    /// generation. Default 500ms (normal A/V lead is ≪ 100ms).
+    #[serde(default = "default_av_tfdt_max_skew_ms")]
+    pub av_tfdt_max_skew_ms: u64,
+    /// How often the publish session re-checks the latest on-disk segment for
+    /// A/V `tfdt` skew (seconds). Segment drain also checks every fragment.
+    #[serde(default = "default_av_tfdt_check_interval_secs")]
+    pub av_tfdt_check_interval_secs: u64,
+}
+
+/// Ingest re-encode profile (Phase 4). Default remains passthrough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReencodeProfile {
+    #[default]
+    Off,
+    Force2sGop,
+}
+
+fn default_reencode_profile() -> ReencodeProfile {
+    ReencodeProfile::Off
+}
+
+fn default_av_tfdt_max_skew_ms() -> u64 {
+    500
+}
+
+fn default_av_tfdt_check_interval_secs() -> u64 {
+    2
 }
 
 impl CacheConfig {
@@ -179,10 +212,22 @@ impl Config {
         if self.cache.cleanup_interval_secs == 0 {
             bail!("cache.cleanup_interval_secs must be >= 1");
         }
+        if self.cache.av_tfdt_max_skew_ms == 0 {
+            bail!("cache.av_tfdt_max_skew_ms must be >= 1");
+        }
+        if self.cache.av_tfdt_check_interval_secs == 0 {
+            bail!("cache.av_tfdt_check_interval_secs must be >= 1");
+        }
         if let Some(ttl) = self.cache.ttl_secs {
             if ttl == 0 {
                 bail!("cache.ttl_secs must be >= 1 when set");
             }
+        }
+        if matches!(self.cache.reencode_profile, ReencodeProfile::Force2sGop) {
+            tracing::warn!(
+                "cache.reencode_profile=force_2s_gop is configured (opt-in Phase 4); \
+                 passthrough remains preferred when upstream GOP can be fixed — see doc/gop_origin_runbook.md"
+            );
         }
 
         let mut seen = std::collections::HashSet::new();

@@ -1,3 +1,3 @@
 mod manager;
 
-pub use manager::{ChannelLease, ChannelManager};
+pub use manager::{AcquiredChannel, ChannelLease, ChannelManager, KickSignal};

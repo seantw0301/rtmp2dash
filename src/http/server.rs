@@ -62,13 +62,18 @@ pub async fn run(cfg: Arc<Config>, channels: ChannelManager) -> anyhow::Result<(
     Ok(())
 }
 
-/// `GET /metrics` — basic Prometheus-style active channel count.
+/// `GET /metrics` — Prometheus-style active channels + Origin CMAF duration stats.
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let channels = state.channels.list_active().len();
+    let body = format!(
+        "rtmp2dash_active_channels {channels}\n{}{}",
+        crate::dash::render_origin_metrics("rtmp2dash"),
+        crate::dash::render_av_skew_metrics("rtmp2dash")
+    );
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        format!("rtmp2dash_active_channels {channels}\n"),
+        body,
     )
 }
 

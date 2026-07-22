@@ -2,6 +2,7 @@ mod cache;
 mod channel;
 mod config;
 mod dash;
+mod debug_ndjson;
 mod demux;
 mod http;
 mod rtmp;

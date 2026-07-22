@@ -23,10 +23,14 @@ cache:
   dir: "./cache"
   segment_duration_secs: 2
   window_segments: 90
-  # 逾時刪除 seg_*.m4s（依 mtime）。init.mp4 與 index.mpd 永不由 janitor 清理。
+  # 逾時刪除 seg_*.m4s（依 mtime）。若已無 segment 且 index.mpd 也逾 TTL，一併刪除幽靈 MPD（與 orphan init.mp4）。
   # 未設定時預設為 max(30, window_segments * segment_duration_secs * 2)
   # ttl_secs: 60
-  cleanup_interval_secs: 10
+  cleanup_interval_secs: 180
+  # |audio_tfdt − video_tfdt| 超過此值（ms）立即 rotate 重建 timeline
+  av_tfdt_max_skew_ms: 500
+  # 推流 session 定時重掃最新 seg 的 A/V tfdt（秒）
+  av_tfdt_check_interval_secs: 2
 
 # 拉流（可與本機推流並行；可多筆）
 pull:
@@ -47,8 +51,10 @@ pull:
 | `cache.dir` | 是 | — | 輸出根目錄 |
 | `cache.segment_duration_secs` | 否 | `2` | 切片目標秒數（必須 > 0） |
 | `cache.window_segments` | 否 | `90` | 視窗內保留的 segment 數（約 3 分鐘＠2s）；磁碟多留 2 片 grace |
-| `cache.ttl_secs` | 否 | 自動 | 背景清理過期檔案的秒數（不得低於 live 視窗）；**不含 `init.mp4`** |
+| `cache.ttl_secs` | 否 | 自動 | 背景清理過期檔案的秒數（不得低於 live 視窗）；無 segment 時可清幽靈 `index.mpd` |
 | `cache.cleanup_interval_secs` | 否 | `10` | janitor 掃描間隔 |
+| `cache.av_tfdt_max_skew_ms` | 否 | `500` | A/V `tfdt` 容許偏差（ms）；超過則 rotate |
+| `cache.av_tfdt_check_interval_secs` | 否 | `2` | 定時重掃最新 seg 的 A/V skew 間隔 |
 | `pull` | 否 | `[]` | 遠端 RTMP 拉流列表 |
 | `pull[].url` | 是* | — | 遠端 RTMP URL（`rtmp://host:port/app/stream`） |
 | `pull[].channel` | 是* | — | 輸出 channel 名稱（DASH 路徑） |

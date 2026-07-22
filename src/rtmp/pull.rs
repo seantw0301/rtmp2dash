@@ -9,7 +9,7 @@ use rml_rtmp::sessions::{
     ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
 };
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, sleep};
@@ -17,6 +17,10 @@ use tracing::{error, info, warn};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Origin may keep the TCP/RTMP session alive (pings) after a host restart
+/// without sending A/V. Force reconnect so [`DashPackager::prepare_for_reconnect`]
+/// can open a fresh CMAF generation.
+const MEDIA_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const HANDSHAKE_BUF_LIMIT: usize = 64 * 1024;
 
 /// Run all configured pull sources. Never returns (keeps process alive).
@@ -44,7 +48,7 @@ pub async fn run_all(cfg: Arc<Config>, channels: ChannelManager) -> Result<()> {
 
 /// Acquire a channel lease for one pull source, then run its reconnect loop.
 async fn run_one(cfg: Arc<Config>, channels: ChannelManager, src: PullSource) {
-    let Some(lease) = channels.try_acquire(&src.channel) else {
+    let Some(acquired) = channels.try_acquire(&src.channel) else {
         error!(
             channel = %src.channel,
             "pull channel already in use; will retry acquire"
@@ -53,22 +57,23 @@ async fn run_one(cfg: Arc<Config>, channels: ChannelManager, src: PullSource) {
         let reconnect = Duration::from_secs(src.reconnect_secs.max(1));
         loop {
             sleep(reconnect).await;
-            if let Some(lease) = channels.try_acquire(&src.channel) {
+            if let Some(acquired) = channels.try_acquire(&src.channel) {
                 info!(channel = %src.channel, "pull channel acquired after wait");
-                run_with_lease(cfg, src, lease).await;
+                run_with_lease(cfg, src, acquired.lease).await;
                 return;
             }
         }
     };
 
-    run_with_lease(cfg, src, lease).await;
+    run_with_lease(cfg, src, acquired.lease).await;
 }
 
 /// Keep pulling a remote RTMP source under an exclusive channel lease, reconnecting on failure.
 ///
-/// The DASH packager (and its CMAF segmenter) lives for the entire lease so tfdt / moof
-/// sequence numbers stay continuous across brief origin blips. Codec config re-sent after
-/// reconnect is ignored when identical; a true config change rotates the generation.
+/// The packager instance (and segment **numbering**) lives for the lease, but each
+/// RTMP session gets a **fresh CMAF generation** after disconnect: origin restarts
+/// reset `tfdt` / init even when codec strings look identical, so reusing the old
+/// Segmenter leaves a ghost MPD with 404 segments.
 async fn run_with_lease(cfg: Arc<Config>, src: PullSource, lease: Arc<ChannelLease>) {
     info!(
         channel = %src.channel,
@@ -100,8 +105,7 @@ async fn run_with_lease(cfg: Arc<Config>, src: PullSource, lease: Arc<ChannelLea
             Ok(()) => warn!(channel = %src.channel, "pull session ended"),
             Err(err) => warn!(channel = %src.channel, "pull session error: {err:#}"),
         }
-        // Flush trailing media of this session but keep the segmenter/writer alive.
-        packager.flush_tail();
+        packager.prepare_for_reconnect().await;
         info!(
             channel = %src.channel,
             secs = reconnect.as_secs(),
@@ -179,6 +183,7 @@ async fn pull_session(
 
     let mut connected = false;
     let mut playing = false;
+    let mut last_media_at = Instant::now();
 
     if !leftover.is_empty() {
         let results = session.handle_input(&leftover)?;
@@ -190,6 +195,7 @@ async fn pull_session(
             &parsed.stream_key,
             &mut connected,
             &mut playing,
+            &mut last_media_at,
             results,
         )
         .await?;
@@ -197,10 +203,33 @@ async fn pull_session(
 
     let mut read_buf = vec![0u8; 64 * 1024];
     loop {
-        let n = match timeout(READ_TIMEOUT, socket.read(&mut read_buf)).await {
+        if playing && last_media_at.elapsed() > MEDIA_IDLE_TIMEOUT {
+            bail!(
+                "pull media idle timeout ({MEDIA_IDLE_TIMEOUT:?}) — forcing reconnect for generation reset"
+            );
+        }
+
+        let read_budget = if playing {
+            // Wake often enough for MEDIA_IDLE_TIMEOUT and A/V tfdt skew timer.
+            READ_TIMEOUT
+                .min(MEDIA_IDLE_TIMEOUT)
+                .min(Duration::from_secs(2))
+        } else {
+            READ_TIMEOUT
+        };
+        let n = match timeout(read_budget, socket.read(&mut read_buf)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err.into()),
+            Err(_) if playing && last_media_at.elapsed() > MEDIA_IDLE_TIMEOUT => {
+                bail!(
+                    "pull media idle timeout ({MEDIA_IDLE_TIMEOUT:?}) — forcing reconnect for generation reset"
+                );
+            }
+            Err(_) if playing => {
+                packager.check_av_skew_on_disk();
+                continue;
+            }
             Err(_) => bail!("pull read idle timeout ({READ_TIMEOUT:?})"),
         };
 
@@ -219,6 +248,7 @@ async fn pull_session(
             &parsed.stream_key,
             &mut connected,
             &mut playing,
+            &mut last_media_at,
             results,
         )
         .await?;
@@ -239,6 +269,7 @@ async fn process_client_results(
     stream_key: &str,
     connected: &mut bool,
     playing: &mut bool,
+    last_media_at: &mut Instant,
     results: Vec<ClientSessionResult>,
 ) -> Result<()> {
     for result in results {
@@ -255,6 +286,7 @@ async fn process_client_results(
                     stream_key,
                     connected,
                     playing,
+                    last_media_at,
                     event,
                 )
                 .await?;
@@ -274,6 +306,7 @@ async fn handle_client_event(
     stream_key: &str,
     connected: &mut bool,
     playing: &mut bool,
+    last_media_at: &mut Instant,
     event: ClientSessionEvent,
 ) -> Result<()> {
     match event {
@@ -289,8 +322,10 @@ async fn handle_client_event(
         ClientSessionEvent::PlaybackRequestAccepted => {
             info!(stream = %stream_key, "pull playback accepted");
             *playing = true;
+            *last_media_at = Instant::now();
         }
         ClientSessionEvent::VideoDataReceived { data, timestamp } => {
+            *last_media_at = Instant::now();
             match demux.push_video(&data, timestamp.value) {
                 Ok(aus) => {
                     for au in aus {
@@ -301,6 +336,7 @@ async fn handle_client_event(
             }
         }
         ClientSessionEvent::AudioDataReceived { data, timestamp } => {
+            *last_media_at = Instant::now();
             match demux.push_audio(&data, timestamp.value) {
                 Ok(aus) => {
                     for au in aus {
@@ -319,7 +355,7 @@ async fn handle_client_event(
         | ClientSessionEvent::UnhandleableOnStatusCode { .. } => {}
     }
 
-    let _ = (connected, playing);
+    let _ = connected;
     Ok(())
 }
 
