@@ -57,42 +57,15 @@ pub struct DashPackager {
     /// Last time [`Self::check_av_skew_on_disk`] ran.
     last_av_skew_check: Option<Instant>,
     /// `Period@id` for the current CMAF generation. Bumped on every wipe/rotate
-    /// so source/edge can purge when segment numbers intentionally continue.
+    /// together with a segment-number restart (explicit discontinuity).
     period_id: u64,
 }
 
 impl DashPackager {
-    /// Create a packager that wipes the channel dir and restarts at seg 1.
-    /// Prefer [`Self::resume`] for live publish/pull so downstream does not see a
-    /// segment-number regression on every publisher reconnect.
+    /// Wipe the channel dir and restart at seg_1 with a fresh [`Self::period_id`].
     pub fn new(out_dir: PathBuf, cache: &CacheConfig) -> Result<Self> {
-        Self::create(out_dir, cache, /*clear=*/ true)
-    }
-
-    /// Continue segment numbering from on-disk `seg_*.m4s`, but wipe leftover media.
-    /// A brand-new Segmenter always starts tfdt at 0, so prior fragments are never
-    /// compatible with a new init — keeping them would desync playback. Continuing
-    /// the number space avoids false "generation reset" tears on trans `/mpegts`.
-    pub fn resume(out_dir: PathBuf, cache: &CacheConfig) -> Result<Self> {
-        Self::create(out_dir, cache, /*clear=*/ false)
-    }
-
-    fn create(out_dir: PathBuf, cache: &CacheConfig, clear: bool) -> Result<Self> {
-        let next_segment_number = if clear {
-            clear_channel_dir(&out_dir)?;
-            1
-        } else {
-            fs::create_dir_all(&out_dir)?;
-            let next = scan_next_segment_number(&out_dir);
-            // Drop incompatible leftovers from the previous process; numbering continues.
-            wipe_channel_media(&out_dir)?;
-            info!(
-                dir = %out_dir.display(),
-                next_segment = next,
-                "DASH packager resume: wiped prior media, continuing numbering"
-            );
-            next
-        };
+        clear_channel_dir(&out_dir)?;
+        let next_segment_number = 1u64;
         let writer = PackagerWriter::spawn(out_dir.clone());
         let period_id = next_period_id(0);
 
@@ -122,9 +95,33 @@ impl DashPackager {
         })
     }
 
+    /// Live publish / takeover entry: wipe leftover media and **restart at seg_1**
+    /// with a fresh [`Self::period_id`].
+    ///
+    /// A new Segmenter always starts `tfdt` at 0, so prior fragments are never
+    /// compatible with the new init. The older "continue `$Number$`" resume left
+    /// climbing segment numbers paired with a reset timeline — source/trans then
+    /// saw `source tfdt regressed` without a matching sequence rewind. Restarting
+    /// at seg_1 is the explicit discontinuity signal (`Period@id` + numbering
+    /// reset) that source already maps to `EXT-X-DISCONTINUITY-SEQUENCE`.
+    pub fn resume(out_dir: PathBuf, cache: &CacheConfig) -> Result<Self> {
+        info!(
+            dir = %out_dir.display(),
+            next_segment = 1u64,
+            "DASH packager resume: wiped prior media, restarting at seg_1 (explicit discontinuity)"
+        );
+        Self::new(out_dir, cache)
+    }
+
     /// Advance [`Self::period_id`] so the next MPD advertises a new Period.
     fn bump_period_id(&mut self) {
         self.period_id = next_period_id(self.period_id);
+    }
+
+    /// Restart `$Number$` at 1 after a generation wipe (takeover / rotate / reconnect).
+    fn restart_numbering_for_discontinuity(&mut self) {
+        self.next_segment_number = 1;
+        self.window_start = 1;
     }
 
     /// Ingest one access unit (codec config or sample) into the live DASH pipeline.
@@ -242,7 +239,7 @@ impl DashPackager {
     /// left a frozen `index.mpd` while janitor deleted the segments (ghost MPD).
     ///
     /// This drops the live generation (in-memory + on disk), clears codec configs
-    /// so we wait for fresh SPS/PPS + ASC, and keeps segment numbering.
+    /// so we wait for fresh SPS/PPS + ASC, and restarts numbering at seg_1.
     pub async fn prepare_for_reconnect(&mut self) {
         if let Some(seg) = self.segmenter.as_mut() {
             let _ = seg.flush();
@@ -259,7 +256,7 @@ impl DashPackager {
         self.availability_start_time = None;
         self.timeline.clear();
         self.next_start_ticks = 0;
-        self.window_start = self.next_segment_number;
+        self.restart_numbering_for_discontinuity();
         self.bump_period_id();
 
         // Drain any already-queued writes, then sync-wipe so a late MPD cannot
@@ -277,7 +274,7 @@ impl DashPackager {
             dir = %self.out_dir.display(),
             next_segment = self.next_segment_number,
             period_id = self.period_id,
-            "DASH packager reset after disconnect (awaiting new codec configs)"
+            "DASH packager reset after disconnect (seg_1 discontinuity, awaiting codecs)"
         );
     }
 
@@ -297,9 +294,9 @@ impl DashPackager {
     }
 
     /// Tear down the current generation and start a new one with the current codec configs.
-    /// Segment numbers continue; old media + MPD are removed so clients never pair a new
-    /// init.mp4 with leftover segments. [`Self::period_id`] advances so downstream can
-    /// detect the silent numbering continue.
+    /// Old media + MPD are removed and numbering restarts at seg_1 with a new
+    /// [`Self::period_id`] so downstream sees an explicit discontinuity (not a
+    /// climbing `$Number$` paired with a reset `tfdt`).
     fn rotate(&mut self) {
         if let Some(seg) = self.segmenter.as_mut() {
             let _ = seg.flush();
@@ -316,13 +313,13 @@ impl DashPackager {
         self.purge_generation_files();
         self.timeline.clear();
         self.next_start_ticks = 0;
-        self.window_start = self.next_segment_number;
+        self.restart_numbering_for_discontinuity();
         self.bump_period_id();
         info!(
             dir = %self.out_dir.display(),
             period_id = self.period_id,
             next_segment = self.next_segment_number,
-            "DASH generation rotated"
+            "DASH generation rotated (seg_1 discontinuity)"
         );
 
         let (Some(video), Some(audio)) = (self.video_config.clone(), self.audio_config.clone())
@@ -628,6 +625,8 @@ fn newest_segment_path(out_dir: &Path) -> Option<PathBuf> {
 }
 
 /// Highest remaining `seg_N.m4s` number + 1, or 1 when the directory is empty.
+/// Retained for tests / diagnostics; live paths restart at seg_1 on wipe.
+#[cfg(test)]
 fn scan_next_segment_number(out_dir: &Path) -> u64 {
     let mut max_seg = 0u64;
     if let Ok(entries) = fs::read_dir(out_dir) {
@@ -767,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_wipes_old_media_and_continues_numbering() {
+    fn resume_wipes_old_media_and_restarts_at_seg_1() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("seg_10.m4s"), b"a").unwrap();
         fs::write(dir.path().join("seg_11.m4s"), b"b").unwrap();
@@ -781,11 +780,13 @@ mod tests {
             .build()
             .unwrap();
         let packager = rt.block_on(async {
-            let p = DashPackager::resume(dir.path().to_path_buf(), &cache).unwrap();
-            // Give wipe a moment; wipe is sync before spawn.
-            p
+            DashPackager::resume(dir.path().to_path_buf(), &cache).unwrap()
         });
-        assert_eq!(packager.next_segment_number, 12);
+        assert_eq!(
+            packager.next_segment_number, 1,
+            "publish resume must restart numbering (explicit discontinuity)"
+        );
+        assert!(packager.period_id > 0);
         assert!(packager.timeline.is_empty());
         assert!(!dir.path().join("seg_10.m4s").exists());
         assert!(!dir.path().join("seg_11.m4s").exists());
@@ -813,7 +814,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rotate_purges_old_segments_and_continues_numbering() {
+    async fn rotate_purges_old_segments_and_restarts_at_seg_1() {
         let dir = tempdir().unwrap();
         let cache = test_cache(dir.path());
         let mut packager = DashPackager::new(dir.path().to_path_buf(), &cache).unwrap();
@@ -843,7 +844,8 @@ mod tests {
         // Drain the delete/init queue.
         packager.finish().await;
 
-        assert_eq!(packager.next_segment_number, 50);
+        assert_eq!(packager.next_segment_number, 1);
+        assert_eq!(packager.window_start, 1);
         assert!(packager.period_id > period_before);
         assert!(packager.timeline.is_empty());
         assert!(!dir.path().join("seg_48.m4s").exists());
@@ -854,7 +856,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn prepare_for_reconnect_wipes_generation_and_keeps_numbering() {
+    async fn prepare_for_reconnect_wipes_generation_and_restarts_at_seg_1() {
         let dir = tempdir().unwrap();
         let cache = test_cache(dir.path());
         let mut packager = DashPackager::new(dir.path().to_path_buf(), &cache).unwrap();
@@ -879,7 +881,8 @@ mod tests {
 
         packager.prepare_for_reconnect().await;
 
-        assert_eq!(packager.next_segment_number, 50);
+        assert_eq!(packager.next_segment_number, 1);
+        assert_eq!(packager.window_start, 1);
         assert!(packager.timeline.is_empty());
         assert!(packager.video_config.is_none());
         assert!(packager.audio_config.is_none());

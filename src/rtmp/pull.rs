@@ -1,7 +1,7 @@
 use crate::channel::{ChannelLease, ChannelManager};
 use crate::config::{Config, PullSource};
 use crate::dash::DashPackager;
-use crate::demux::FlvDemux;
+use crate::demux::{AccessUnit, FlvDemux};
 use anyhow::{Context, Result, bail};
 use bytes::BytesMut;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
@@ -20,7 +20,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Origin may keep the TCP/RTMP session alive (pings) after a host restart
 /// without sending A/V. Force reconnect so [`DashPackager::prepare_for_reconnect`]
 /// can open a fresh CMAF generation.
-const MEDIA_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+// Keep this below the fleet's AvRelay connect window: after an origin restart,
+// a ping-only RTMP socket must reconnect before `/mpegts` is declared stalled.
+const MEDIA_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDSHAKE_BUF_LIMIT: usize = 64 * 1024;
 
 /// Run all configured pull sources. Never returns (keeps process alive).
@@ -325,9 +327,11 @@ async fn handle_client_event(
             *last_media_at = Instant::now();
         }
         ClientSessionEvent::VideoDataReceived { data, timestamp } => {
-            *last_media_at = Instant::now();
             match demux.push_video(&data, timestamp.value) {
                 Ok(aus) => {
+                    if aus.iter().any(is_media_sample) {
+                        *last_media_at = Instant::now();
+                    }
                     for au in aus {
                         let _ = packager.handle_au(au);
                     }
@@ -336,9 +340,11 @@ async fn handle_client_event(
             }
         }
         ClientSessionEvent::AudioDataReceived { data, timestamp } => {
-            *last_media_at = Instant::now();
             match demux.push_audio(&data, timestamp.value) {
                 Ok(aus) => {
+                    if aus.iter().any(is_media_sample) {
+                        *last_media_at = Instant::now();
+                    }
                     for au in aus {
                         let _ = packager.handle_au(au);
                     }
@@ -357,6 +363,10 @@ async fn handle_client_event(
 
     let _ = connected;
     Ok(())
+}
+
+fn is_media_sample(au: &AccessUnit) -> bool {
+    matches!(au, AccessUnit::VideoSample(_) | AccessUnit::AudioSample(_))
 }
 
 /// Send all outbound packets from a batch of client session results to the socket.

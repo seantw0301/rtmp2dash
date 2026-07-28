@@ -547,11 +547,11 @@ async fn handle_event(
                 Some(acquired) => {
                     let dir = ChannelManager::ensure_channel_dir(cfg, &stream_key)
                         .context("create channel cache dir")?;
-                    // Resume numbering across publisher reconnects / idle re-push.
-                    // `new()` clears the channel and restarts at seg_1, which makes
-                    // downstream trans_server treat the playlist as a generation
-                    // reset (segment numbering regressed) and tear down /mpegts —
-                    // STB clients then see Input Exception / Eof loops (ttv/haka).
+                    // Takeover / DHCP re-push: wipe + restart at seg_1 with a new
+                    // Period@id. Continuing `$Number$` while tfdt resets to 0 made
+                    // trans_server report `source tfdt regressed` without a matching
+                    // sequence rewind; restarting at seg_1 is the explicit
+                    // discontinuity source already maps to EXT-X-DISCONTINUITY.
                     match DashPackager::resume(dir, &cfg.cache) {
                         Ok(pkg) => {
                             *packager = Some(pkg);
